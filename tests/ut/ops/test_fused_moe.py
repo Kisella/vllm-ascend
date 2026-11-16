@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import weakref
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -14,7 +15,7 @@ from vllm.model_executor.layers.activation import SituAndMul
 
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
 from vllm_ascend.ops import register_custom_ops as custom_ops
 from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
@@ -732,6 +733,7 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
     assert weights is topk_weights
     assert weights.dtype == torch.float32
     assert ids is topk_ids
+    # The upstream router normalizes padding after gathering token IDs.
     torch.testing.assert_close(hash_op.call_args.kwargs["input_ids"], torch.tensor([22, 0], dtype=torch.int64))
     prepare_finalize.all_gather_input_ids.assert_called_once()
     actual_input_ids = prepare_finalize.all_gather_input_ids.call_args.args[0]
@@ -743,7 +745,7 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
 
 @pytest.mark.parametrize("image_sentinel_lo", [129257, 129264])
 @pytest.mark.parametrize("renormalize", [True, False])
-def test_vision_router_preserves_reference_routing_on_a5(monkeypatch, image_sentinel_lo, renormalize):
+def test_vision_router_preserves_reference_routing_without_native_vision(monkeypatch, image_sentinel_lo, renormalize):
     input_ids = torch.tensor([-1, image_sentinel_lo], dtype=torch.int32)
     hidden_states = torch.randn(2, 4)
     router_logits = torch.randn(2, 4, dtype=torch.float32)
@@ -758,10 +760,12 @@ def test_vision_router_preserves_reference_routing_on_a5(monkeypatch, image_sent
             moe_comm_method=SimpleNamespace(prepare_finalize=prepare_finalize),
         ),
     )
+    profile = get_hardware_profile(AscendDeviceType.A5)
+    profile = replace(profile, capabilities=profile.capabilities - {HardwareCapability.MOE_GATING_TOP_K_HASH_VISION})
     monkeypatch.setattr(
         fused_topk_router_module,
         "get_current_hardware_profile",
-        lambda: get_hardware_profile(AscendDeviceType.A5),
+        lambda: profile,
     )
     hash_op = MagicMock(side_effect=AssertionError("Vision routing must not call the hash kernel"))
     monkeypatch.setattr(
@@ -2487,7 +2491,7 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     assert result[1] is routed_out
 
 
-def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None):
+def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None, fused_mc2_comm=None):
     """Construct AscendMoERunner with a lightweight MoERunner.__init__ stub."""
     moe_config = SimpleNamespace(hidden_dim=4, ep_size=1)
     routed_experts = SimpleNamespace(
@@ -2528,7 +2532,16 @@ def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None):
     monkeypatch.setattr(fused_moe_module, "get_tp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "get_dp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", MagicMock())
-    monkeypatch.setattr(fused_moe_module, "get_moe_comm_method", MagicMock(return_value=None))
+
+    def get_comm_method(kind, config):
+        assert config is moe_config
+        return fused_mc2_comm if kind == MoECommType.FUSED_MC2 else None
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "get_moe_comm_method",
+        get_comm_method,
+    )
 
     return AscendMoERunner(
         "model.layers.0.mlp",
@@ -2538,6 +2551,17 @@ def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None):
         gate=gate,
         shared_experts=shared_experts,
     )
+
+
+def test_runner_keeps_mega_moe_activation_with_each_layer(monkeypatch):
+    first_kwargs = {"activation": "situglu", "activation_params": {"beta": 4.0, "linear_beta": 25.0}}
+    first = _stub_moe_runner_init(monkeypatch, fused_mc2_comm=SimpleNamespace(mega_moe_activation_kwargs=first_kwargs))
+    second_kwargs = {"activation_clamp": None}
+    second = _stub_moe_runner_init(
+        monkeypatch, fused_mc2_comm=SimpleNamespace(mega_moe_activation_kwargs=second_kwargs)
+    )
+    assert first.routed_experts.mega_moe_activation_kwargs is first_kwargs
+    assert second.routed_experts.mega_moe_activation_kwargs is second_kwargs
 
 
 def test_runner_sets_precast_fp32_weight(monkeypatch):
