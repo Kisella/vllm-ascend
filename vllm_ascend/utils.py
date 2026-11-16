@@ -87,6 +87,15 @@ _CUSTOM_OP_BASE_DIR = (
 _IS_ROT_WEIGHT_USED = None
 
 
+def is_gqa_pcp_dcp_config(model_config: Any, parallel_config: Any) -> bool:
+    """Whether a GQA/MQA model enables both PCP and DCP."""
+    return (
+        parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size > 1
+        and not model_config.use_mla
+    )
+
+
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
     """Extract DSV4 index for config per-layer arrays.
 
@@ -828,7 +837,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
     from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
     from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
-    from vllm_ascend.ops.layernorm import AscendFusedRMSNormGated, AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
         AscendMergedColumnParallelLinear,
@@ -878,7 +887,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "MMEncoderAttention": AscendMMEncoderAttention,
         "ApplyRotaryEmb": AscendApplyRotaryEmb,
         "RMSNormGated": AscendRMSNormGated,
-        "FusedRMSNormGated": AscendFusedRMSNormGated,
         "Conv3dLayer": AscendConv3dLayer,
         "RelPosAttention": AscendRelPosAttention,
         "CustomQwen2Decoder": AscendCustomQwen2Decoder,
@@ -946,6 +954,18 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
+def register_ascend_fla_customop():
+    """Resolve the FLA subclass after selecting a device, before model loading.
+
+    Registration happens once inside the imported module, under Python's
+    module import lock. Repeated calls keep the same class and registry key.
+    """
+    from vllm_ascend.ops.fused_rms_norm_gated import AscendFusedRMSNormGated
+
+    REGISTERED_ASCEND_OPS["FusedRMSNormGated"] = AscendFusedRMSNormGated
+    return AscendFusedRMSNormGated
+
+
 def lmhead_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 0
 
@@ -985,6 +1005,69 @@ def mlp_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
 
 
+def _flashcomm_switch_enabled(vllm_config) -> bool:
+    """Whether the user explicitly turned on the FlashComm switch.
+
+    Mirrors the ``enable_flashcomm1`` read in
+    ``AscendConfig.derive_and_validate`` (additional_config first, then the
+    ``VLLM_ASCEND_ENABLE_FLASHCOMM1`` env var) so this predicate and the
+    config-time resolution can never diverge.
+    """
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    switch = additional_config.get("enable_flashcomm1", False)
+    if isinstance(switch, str):
+        return switch.strip().lower() in ("1", "true")
+    if bool(switch):
+        return True
+    return os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower() in ("1", "true")
+
+
+# Dense (non-MoE) model families that run sequence parallelism through the
+# FlashComm switch on Ascend. The Qwen3.5 dense family covers Qwen3.5-27B,
+# Qwen3.6-27B and Qwen3.8-27B dense checkpoints (model_type "qwen3_5_text").
+DENSE_SP_MODEL_TYPES = ("qwen3_5_text",)
+
+
+def enable_dense_sp(vllm_config=None) -> bool:
+    """Dense-model sequence parallelism for the Qwen3.5 dense family.
+
+    Upstream gates sequence parallelism on ``use_sequence_parallel_moe``,
+    which requires an MoE checkpoint with expert parallelism. On Ascend the
+    FlashComm switch additionally covers the dense Qwen3.5 family: hidden
+    states and the residual stay sequence-sharded across the whole decoder
+    stack, attention (full and GDN) gathers before / reduce-scatters after its
+    sequence-parallel output projection, and the dense MLP gathers around its
+    TP-sharded weights. Enabled with TP > 1, PP == 1 and
+    ``additional_config.enable_flashcomm1`` (or the
+    ``VLLM_ASCEND_ENABLE_FLASHCOMM1`` env var).
+    """
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except AssertionError:
+            vllm_config = None
+
+    if vllm_config is None:
+        return False
+
+    parallel_config = vllm_config.parallel_config
+    tp_size = getattr(parallel_config, "tensor_parallel_size", 0)
+    pp_size = getattr(parallel_config, "pipeline_parallel_size", 0)
+    if tp_size <= 1 or pp_size != 1:
+        return False
+
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return False
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if getattr(hf_text_config, "model_type", None) not in DENSE_SP_MODEL_TYPES:
+        return False
+
+    return _flashcomm_switch_enabled(vllm_config)
+
+
 def enable_sp(vllm_config=None) -> bool:
     if vllm_config is None:
         try:
@@ -997,7 +1080,7 @@ def enable_sp(vllm_config=None) -> bool:
     if vllm_config is None:
         return False
 
-    return bool(vllm_config.parallel_config.use_sequence_parallel_moe)
+    return bool(vllm_config.parallel_config.use_sequence_parallel_moe) or enable_dense_sp(vllm_config)
 
 
 # TODO remove it after vllm has this func
@@ -1362,6 +1445,9 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
 # the QFA path (the QFA D=256 requirement doc allows block sizes 512/1024).
 A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
 
+# Dense-kernel minimum for upstream alignment, not the final M3 cache block.
+MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE = 64
+
 # Enabled with ``--kv-cache-dtype mxfp8``, like the other Ascend C8 KV cache
 # flavors. The ModelSlim checkpoint recipe (fa_v.scale weights) is loaded when
 # present; it is not the switch.
@@ -1369,7 +1455,28 @@ C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
 
 
 def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
-    return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+    # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
+    # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+
+def is_minimax_m3_fp8_kv_cache(vllm_config: VllmConfig | None) -> bool:
+    if vllm_config is None:
+        return False
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", None) or ()
+    return (
+        any(
+            architecture in ("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+            for architecture in architectures
+        )
+        and cache_config is not None
+        and cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+        and bool(cache_config.kv_cache_dtype_skip_layers)
+        and get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+    )
 
 
 def refresh_block_size(vllm_config):

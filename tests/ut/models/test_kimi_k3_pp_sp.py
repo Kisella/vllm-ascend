@@ -5,6 +5,7 @@
 import __future__
 
 import ast
+import logging
 import threading
 from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor
@@ -61,6 +62,7 @@ def config(tp=2, pp=2, dp=1, ep=True, architecture="KimiLinearForCausalLM", runn
             pipeline_parallel_size=pp,
             data_parallel_size=dp,
             enable_expert_parallel=ep,
+            enable_eplb=False,
             use_sequence_parallel_moe=dp > 1 and tp > 1 and ep,
         ),
     )
@@ -457,12 +459,16 @@ def test_draft_mapper_reuses_upstream_rules(owns_embed):
         {".gate_proj": (".gate_up_proj", 0)},
     )
     captured = []
+
+    def load_weights(weights, *, mapper):
+        captured.append(mapper)
+        return {name for name, _ in weights}
+
     namespace = {
         "BaseModel": nn.Module,
         "replace": replace,
-        "AutoWeightsLoader": lambda model: SimpleNamespace(
-            load_weights=lambda weights, mapper: captured.append(mapper)
-        ),
+        "logger": logging.getLogger(__name__),
+        "AutoWeightsLoader": lambda model: SimpleNamespace(load_weights=load_weights),
     }
     load_definitions(
         "vllm_ascend/models/kimi_k3_dspark.py",
@@ -474,7 +480,7 @@ def test_draft_mapper_reuses_upstream_rules(owns_embed):
     model = namespace["AscendK3DSparkForCausalLM"]()
     model.hf_to_vllm_mapper = mapper
     model._owns_embed_tokens = owns_embed
-    model.load_weights([])
+    assert model.load_weights([]) == set()
     selected = captured[0]
     expected = dict(mapper.orig_to_new_substr)
     if owns_embed:
@@ -571,6 +577,8 @@ def test_host_positions_after_rejection_or_chunk(
         methods={"NPUModelRunner": {"postprocess_sampled", "postprocess_num_computed_tokens", "_update_seq_lens_cpu"}},
     )
     runner = namespace["NPUModelRunner"]()
+    # This harness bypasses __init__; retain the original host-length path.
+    runner._skip_spec_cpu_length_sync = False
     runner.speculator = object() if owns_speculator else None
     runner.use_spec_pp = use_pp and num_speculative_steps > 0 and legacy_transport
     runner.use_pp = use_pp

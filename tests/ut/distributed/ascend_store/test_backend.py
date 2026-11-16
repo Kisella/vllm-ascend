@@ -479,6 +479,36 @@ class TestMooncakeBackendSetup(unittest.TestCase):
                 self.assertEqual(setup_kwargs["global_segment_size"], 0)
                 self.assertEqual(setup_kwargs["local_buffer_size"], 0)
 
+    def test_scheduler_client_skips_ssd_offload(self):
+        for use_fabric_mem, use_store_independent_te in ((False, False), (True, False), (False, True)):
+            with (
+                self.subTest(use_fabric_mem=use_fabric_mem, use_store_independent_te=use_store_independent_te),
+                tempfile.TemporaryDirectory(prefix="mooncake_ssd_ut_") as ssd_path,
+            ):
+                backend = self._make_backend(
+                    config=_make_mooncake_store_config(
+                        tenant_id="tenant-a",
+                        enable_ssd_offload=True,
+                        ssd_offload_path=ssd_path,
+                    ),
+                    use_fabric_mem=use_fabric_mem,
+                    contribute_memory=False,
+                )
+                backend._use_store_independent_te = use_store_independent_te
+                store = MagicMock()
+                store.setup.return_value = 0
+
+                self.assertIs(self._setup_store(backend, store), store)
+
+                store.setup.assert_called_once()
+                setup_kwargs = store.setup.call_args.kwargs
+                self.assertNotIn("enable_ssd_offload", setup_kwargs)
+                self.assertNotIn("ssd_offload_path", setup_kwargs)
+                self.assertEqual(setup_kwargs["tenant_id"], "tenant-a")
+                self.assertEqual(setup_kwargs["global_segment_size"], 0)
+                self.assertEqual(setup_kwargs["local_buffer_size"], 0)
+                self.assertEqual(os.listdir(ssd_path), [])
+
     def test_non_default_tenant_preserves_setup_type_error(self):
         setup_error = TypeError("setup(): incompatible function arguments")
         backend = self._make_backend(
@@ -1347,11 +1377,8 @@ class TestMemcacheBackendMethods(unittest.TestCase):
         b.store.batch_get_key_info.return_value = [ssd]
         b.store.batch_get_into.return_value = [-1]
         b.store.register_buffer.return_value = 0
-        with (
-            patch.object(memcache_module.torch, "empty", return_value=SimpleNamespace(data_ptr=lambda: 8192)),
-            self.assertRaisesRegex(RuntimeError, "SSD rewarm failed"),
-        ):
-            b.batch_get_key_info(["ssd-key"], for_load=True)
+        with patch.object(memcache_module.torch, "empty", return_value=SimpleNamespace(data_ptr=lambda: 8192)):
+            self.assertEqual(b.batch_get_key_info(["ssd-key"], for_load=True), [None])
         b.store.unregister_buffer.assert_called_once_with(8192, 64)
 
     def test_exists(self):
@@ -1397,12 +1424,13 @@ class TestMemcacheBackendMethods(unittest.TestCase):
                 with self.assertRaises(backend_base.BatchResultShapeError):
                     b.batch_is_readable(["missing", "malformed"])
 
-    def test_batch_is_readable_rejects_misaligned_metadata(self):
+    def test_batch_is_readable_query_failure_is_miss(self):
         b = self._make_backend()
-        b.store.batch_get_key_info.return_value = []
-
-        with self.assertRaises(backend_base.BatchResultShapeError):
-            b.batch_is_readable(["k1"])
+        keys = [f"k{i}" for i in range(495)]
+        for key_infos in ([], None, [None]):
+            with self.subTest(key_infos=key_infos):
+                b.store.batch_get_key_info.return_value = key_infos
+                self.assertEqual(b.batch_is_readable(keys), [False] * len(keys))
 
     def test_setup_uses_captured_device(self):
         b = self._make_backend()
@@ -1487,12 +1515,6 @@ class TestMemcacheBackendMethods(unittest.TestCase):
 
         self.assertEqual(b.batch_write_finish(["k1"], [0]), [0])
         b.store.batch_write_finish.assert_called_once_with(["k1"], [0])
-
-    def test_batch_write_finish_supports_legacy_store(self):
-        b = self._make_backend()
-        b.store = object()
-
-        self.assertEqual(b.batch_write_finish(["k1"], [0]), [0])
 
     def test_get(self):
         b = self._make_backend()

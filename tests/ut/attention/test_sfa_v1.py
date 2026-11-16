@@ -285,20 +285,6 @@ class TestAscendSFACacheComposition(TestBase):
                 for actual_tensor, expected_tensor in zip(composed, expected):
                     self.assertIs(actual_tensor, expected_tensor)
 
-    @patch("vllm_ascend.attention.indexer.get_ascend_config")
-    def test_li_c8_reshape_optim_requires_layer_li_c8(self, mock_get_ascend_config):
-        indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
-
-        indexer.enable_sparse_li_c8 = False
-        self.assertFalse(indexer._use_c8_reshape_optim())
-
-        indexer.enable_sparse_li_c8 = True
-        self.assertTrue(indexer._use_c8_reshape_optim())
-
-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
-        self.assertFalse(indexer._use_c8_reshape_optim())
-
     @patch("vllm_ascend.attention.sfa_v1.get_forward_context")
     def test_get_indexer_attn_metadata_fetches_by_k_cache_prefix(self, mock_get_forward_context):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
@@ -498,19 +484,11 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         actual_seq_lengths = torch.tensor([3], dtype=torch.int32)
         expected = torch.randn(3, 2, 32)
 
-        with (
-            patch.object(
-                torch.ops._C_ascend,
-                "npu_kv_quant_sparse_flash_attention_vllm",
-                create=True,
-                return_value=(expected, torch.empty(0), torch.empty(0)),
-            ) as mock_qsfa,
-            patch(
-                "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
-                create=True,
-                side_effect=AssertionError("Base must use _C_ascend custom op"),
-            ),
-        ):
+        with patch(
+            "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
+            create=True,
+            return_value=expected,
+        ) as mock_qsfa:
             result = impl._execute_sparse_flash_attention_process(
                 ql_nope,
                 q_pe,
@@ -527,7 +505,7 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         self.assertEqual(call_kwargs["query"].shape, (3, 2, 48))
         self.assertEqual(call_kwargs["key_quant_mode"], 2)
         self.assertEqual(call_kwargs["tile_size"], 128)
-        self.assertFalse(call_kwargs["return_softmax_lse"])
+        self.assertNotIn("return_softmax_lse", call_kwargs)
 
     def test_prolog_v3_enables_packed_int8_kv_cache(self):
         self._check_prolog_v3_enables_packed_kv_cache(AscendW8A8DynamicLinearMethod)
@@ -808,7 +786,6 @@ class TestAscendSFAMetadataBuilder(TestBase):
         self.patcher.start()
 
         mock_ascend_config = MagicMock()
-        mock_ascend_config.c8_reshape_optim_enabled = False
         mock_ascend_config.enable_mlapo = True
         mock_ascend_config.enable_shared_expert_dp = False
         self.ascend_config_patcher = patch(
@@ -1002,90 +979,6 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
-    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
-    @patch("torch.ops._C_ascend.store_kv_block_metadata", create=True)
-    def test_ascend_sfa_metadata_builder_does_not_build_indexer_c8_metadata(
-        self,
-        store_kv_block_metadata,
-        mock_get_cos_and_sin_mla,
-        mock_get_current_vllm_config,
-    ):
-        cfg = MagicMock()
-        cfg.model_config = MagicMock()
-        cfg.model_config.hf_text_config = MagicMock()
-
-        mock_get_current_vllm_config.return_value = cfg
-        kv_cache_spec = MagicMock()
-        kv_cache_spec.block_size = 128
-        layer_names = ["layer1", "layer2"]
-        vllm_config = MagicMock()
-        vllm_config.cache_config.block_size = 16
-        vllm_config.scheduler_config.max_num_seqs = 16
-        vllm_config.parallel_config.prefill_context_parallel_size = 1
-        vllm_config.model_config.max_model_len = 1024
-        vllm_config.model_config.get_head_size.return_value = 64
-        vllm_config.model_config.dtype = torch.float16
-        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
-        vllm_config.kv_transfer_config = SimpleNamespace(
-            kv_role="kv_producer",
-            is_kv_producer=True,
-            is_kv_consumer=False,
-        )
-        speculative_config = MagicMock()
-        speculative_config.num_speculative_tokens = 4
-        vllm_config.speculative_config = speculative_config
-        device = torch.device("cpu")
-
-        common_attn_metadata = MagicMock()
-        common_attn_metadata.decode_token_per_req = 1
-        common_attn_metadata.context_parallel_metadata = None
-        common_attn_metadata.max_query_len = 10
-        common_attn_metadata.num_reqs = 10
-        common_attn_metadata.num_actual_tokens = 100
-        common_attn_metadata.query_start_loc = torch.arange(0, 101, 10, dtype=torch.int32)
-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc.cpu()
-        common_attn_metadata.slot_mapping = torch.randint(0, 10000, (100, 4, 1024), dtype=torch.int64)
-        common_attn_metadata.seq_lens = torch.full((10,), 10, dtype=torch.int32)
-        common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
-        common_attn_metadata._seq_lens_cpu = None
-        common_attn_metadata.positions = torch.randn(100)
-        common_attn_metadata.attn_mask = None
-        common_attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        common_attn_metadata.block_table_tensor = torch.randn(100, 4)
-        common_attn_metadata.cos = None
-        common_attn_metadata.sin = None
-        common_attn_metadata.num_input_tokens = 100
-
-        mock_get_cos_and_sin_mla.return_value = (torch.randn(100), torch.randn(100))
-
-        with patch("vllm_ascend.attention.sfa_v1.get_ascend_config") as mock_get_ascend_config:
-            mock_ascend_config = MagicMock()
-            mock_ascend_config.c8_reshape_optim_enabled = True
-            mock_get_ascend_config.return_value = mock_ascend_config
-
-            builder = AscendSFAMetadataBuilder(
-                kv_cache_spec=kv_cache_spec,
-                layer_names=layer_names,
-                vllm_config=vllm_config,
-                device=device,
-            )
-
-            metadata = builder.build(
-                common_prefix_len=10,
-                common_attn_metadata=common_attn_metadata,
-            )
-
-        assert isinstance(metadata, AscendSFAMetadata)
-        assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
-        assert metadata.slot_mapping.shape == (100, 4, 1024)
-
-        store_kv_block_metadata.assert_not_called()
-        assert metadata.block_size == 128
-        assert metadata.group_len is None
-        assert metadata.group_key_idx is None
-        assert metadata.group_key_cache_idx is None
-
 
 class TestAscendSFAImpl(TestBase):
     @patch("vllm.distributed.parallel_state._TP", new_callable=lambda: MagicMock(spec=GroupCoordinator))
@@ -1185,7 +1078,8 @@ class TestAscendSFAImpl(TestBase):
             **kwargs,
         )
 
-    def test_kvpp_waits_before_native_and_fused_cache_access(self):
+    @patch("vllm_ascend.attention.sfa_v1.oproj_tp_enable", return_value=False)
+    def test_kvpp_waits_before_native_and_fused_cache_access(self, _mock_oproj_tp):
         from vllm_ascend.attention import sfa_v1
 
         hidden = torch.zeros(2, 4)
@@ -1276,6 +1170,121 @@ class TestAscendSFAImpl(TestBase):
                     self.impl.forward("layer", hidden, (), None, output)
                 self.assertEqual(events, [])
                 self.assertEqual(torch.count_nonzero(output).item(), 0)
+
+    def test_idle_rank_participates_in_oproj_tp(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.enable_sparse_sfa_turboquant = False
+        impl.local_num_heads = 2
+        impl.v_head_dim = 3
+        impl.qk_rope_head_dim = 0
+        impl._finalize_o_proj = MagicMock()
+        hidden = torch.randn(8, 4)
+        output = torch.empty_like(hidden)
+        empty_metadata = SimpleNamespace(slot_mapping=torch.empty(0), num_actual_tokens=0)
+
+        with (
+            patch("vllm_ascend.attention.sfa_v1.oproj_tp_enable", return_value=True) as enabled,
+            patch("vllm_ascend.attention.sfa_v1.get_forward_context"),
+        ):
+            for metadata in (None, empty_metadata):
+                with self.subTest(has_metadata=metadata is not None):
+                    impl._finalize_o_proj.reset_mock()
+                    result = impl.forward("layer", hidden, (), metadata, output)
+                    self.assertIs(result, output)
+                    impl._finalize_o_proj.assert_called_once()
+                    attention, projected_output, gather = impl._finalize_o_proj.call_args.args
+                    self.assertEqual(attention.shape, (0, 6))
+                    self.assertEqual(projected_output.shape, (0, 4))
+                    self.assertFalse(gather)
+                    torch.testing.assert_close(output, torch.zeros_like(hidden))
+            enabled.return_value = False
+            for metadata in (None, empty_metadata):
+                impl._finalize_o_proj.reset_mock()
+                result = impl.forward("layer", hidden, (), metadata, output)
+                self.assertIs(result, output)
+                impl._finalize_o_proj.assert_not_called()
+                torch.testing.assert_close(output, torch.zeros_like(hidden))
+
+    def test_oproj_without_tp_preserves_projection_shape_contract(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        attention = torch.randn(2, 6)
+        projected = torch.randn(2, 4)
+        impl.o_proj = MagicMock(return_value=(projected, None))
+        with (
+            patch("vllm_ascend.attention.sfa_v1.oproj_tp_enable", return_value=False),
+            patch("vllm_ascend.attention.sfa_v1.get_potential_max_tokens") as capacity,
+        ):
+            output = torch.empty_like(projected)
+            self.assertIs(impl._finalize_o_proj(attention, output, False), output)
+            self.assertIs(impl.o_proj.call_args.args[0], attention)
+            torch.testing.assert_close(output, projected)
+            with self.assertRaises(RuntimeError):
+                impl._finalize_o_proj(attention, torch.empty(1, 4), False)
+            capacity.assert_not_called()
+
+    def test_oproj_tp_reuses_collective_buffers_and_clears_padding(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        capacity = 4
+        weight = torch.arange(24, dtype=torch.float32).reshape(4, 6) / 10
+        device_group = object()
+        group = SimpleNamespace(world_size=2, rank_in_group=0, device_group=device_group)
+        events = []
+        pointers: list[int] = []
+
+        def exchange(recv, send, *, group):
+            events.append("exchange")
+            self.assertIs(group, device_group)
+            torch.testing.assert_close(send, local_padded.view(capacity, 2, 3).transpose(0, 1).contiguous().view(-1))
+            recv.copy_(torch.cat((local_padded[:, :3], peer_padded[:, :3])).view(-1))
+            pointers.extend((send.data_ptr(), recv.data_ptr()))
+
+        def project(layer, inputs, *, bias):
+            events.append("projection")
+            self.assertIs(layer, impl.o_proj)
+            self.assertIsNone(bias)
+            return torch.nn.functional.linear(inputs, weight[:, :3])
+
+        def reduce_scatter(output, inputs, *, group):
+            events.append("reduce_scatter")
+            self.assertIs(group, device_group)
+            expected = torch.nn.functional.linear(torch.cat((local_padded[:, :3], peer_padded[:, :3])), weight[:, :3])
+            torch.testing.assert_close(inputs, expected)
+            output.copy_(inputs[:capacity] + torch.nn.functional.linear(local_padded[:, 3:], weight[:, 3:]))
+            pointers.extend((inputs.data_ptr(), output.data_ptr()))
+
+        impl.o_proj = SimpleNamespace(
+            input_size_per_partition=3,
+            output_size=4,
+            skip_bias_add=False,
+            bias=None,
+            quant_method=SimpleNamespace(apply=MagicMock(side_effect=project)),
+        )
+        with (
+            patch("vllm_ascend.attention.sfa_v1.oproj_tp_enable", return_value=True),
+            patch("vllm_ascend.attention.sfa_v1.get_otp_group", return_value=group),
+            patch("vllm_ascend.attention.sfa_v1.get_potential_max_tokens", return_value=capacity),
+            patch("vllm_ascend.attention.sfa_v1.dist.all_to_all_single", side_effect=exchange) as all_to_all,
+            patch("vllm_ascend.attention.sfa_v1.dist.reduce_scatter_tensor", side_effect=reduce_scatter) as scatter,
+        ):
+            for num_tokens, peer_tokens in ((2, 1), (1, 2), (0, 1)):
+                with self.subTest(num_tokens=num_tokens):
+                    events.clear()
+                    attention = torch.arange(num_tokens * 6, dtype=torch.float32).reshape(num_tokens, 6) / 10
+                    peer = -torch.arange(peer_tokens * 6, dtype=torch.float32).reshape(peer_tokens, 6) / 10
+                    local_padded = torch.zeros(capacity, 6)
+                    local_padded[:num_tokens] = attention
+                    peer_padded = torch.zeros(capacity, 6)
+                    peer_padded[:peer_tokens] = peer
+                    output = torch.empty(num_tokens, 4)
+                    self.assertIs(impl._finalize_o_proj(attention, output, False), output)
+                    self.assertEqual(events, ["exchange", "projection", "reduce_scatter"])
+                    torch.testing.assert_close(output, torch.nn.functional.linear(attention, weight))
+            self.assertEqual(pointers[:4], pointers[4:8])
+            self.assertEqual(pointers[:4], pointers[8:12])
+            self.assertEqual(all_to_all.call_count, 3)
+            self.assertEqual(scatter.call_count, 3)
+            with self.assertRaisesRegex(ValueError, "exceeds decode capacity"):
+                impl._finalize_o_proj(torch.empty(5, 6), torch.empty(5, 4), False)
 
     def _setup_kv_b_proj(self):
         """Set up kv_b_proj with real weight tensor for process_weights_after_loading."""
@@ -1557,6 +1566,49 @@ class TestAscendSFAImpl(TestBase):
 
         path = self.impl._resolve_preprocess_type(torch.bfloat16)
         self.assertEqual(path, PreprocessType.PROLOG_V3)
+
+    def test_quantized_prolog_with_unquantized_indexer_uses_native(self):
+        self._set_quant(AscendW8A8DynamicLinearMethod)
+        self.impl.has_indexer = True
+        self.impl.skip_indexer_pre_process = False
+        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
+        self.impl.enable_sparse_sfa_turboquant = False
+        self.impl.enable_sparse_sfa_c8 = True
+        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
+
+    def test_quantized_prolog_with_missing_indexer_projection_uses_native(self):
+        self._set_quant(AscendW8A8DynamicLinearMethod)
+        self.impl.has_indexer = True
+        self.impl.indexer = SimpleNamespace()
+        self.impl.enable_sparse_sfa_turboquant = False
+        self.impl.enable_sparse_sfa_c8 = True
+        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
+
+    def test_quantized_prolog_with_quantized_indexer_stays_fused(self):
+        self._set_quant(AscendW8A8DynamicLinearMethod)
+        self.impl.has_indexer = True
+        self.impl.skip_indexer_pre_process = False
+        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace(weight_scale=torch.ones(1)))
+        self.impl.enable_sparse_sfa_turboquant = False
+        self.impl.enable_sparse_sfa_c8 = True
+        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.PROLOG_V3)
+
+    def test_unquantized_prolog_with_unquantized_indexer_uses_native(self):
+        self._set_quant(None)
+        self.impl.is_kv_consumer = True
+        self.impl.has_indexer = True
+        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
+        self.impl.enable_sparse_sfa_turboquant = False
+        self.impl.enable_sparse_sfa_c8 = False
+        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
+
+    def test_skipped_unquantized_indexer_preserves_native_query_path(self):
+        self._set_quant(AscendW8A8DynamicLinearMethod)
+        self.impl.has_indexer = True
+        self.impl.skip_indexer_pre_process = True
+        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
+        self.impl.enable_sparse_sfa_turboquant = False
+        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
 
     def test_resolve_path_w8a8_mlapo_enabled_goes_mlapo(self):
         """W8A8 + enable_mlapo → MLAPO."""

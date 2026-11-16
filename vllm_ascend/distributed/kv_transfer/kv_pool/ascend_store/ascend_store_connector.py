@@ -59,6 +59,9 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 
 
+_LOOKUP_SHUTDOWN_POLL_MS = 100
+
+
 class AscendStoreKVEvents(KVConnectorKVEvents):
     def __init__(self, num_workers: int) -> None:
         self._aggregator = KVEventAggregator(num_workers)
@@ -131,6 +134,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         # align pre-copy is deferred behind this connector's layerwise loads.
         self._mamba_state: Any = None
         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
+        # Opt in only for synchronous bulk loads, not background retrieval.
+        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
 
         self.connector_scheduler: KVPoolScheduler | None = None
         self.connector_worker: KVPoolWorker | None = None
@@ -149,6 +154,22 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
+
+    def shutdown(self):
+        """Stop store users before closing the backend's native resources."""
+        try:
+            if self.connector_scheduler is not None:
+                client = self.connector_scheduler.client
+                try:
+                    if client is not None:
+                        client.close()
+                finally:
+                    self.connector_scheduler.store_scheduler.close()
+        finally:
+            if hasattr(self, "lookup_server"):
+                self.lookup_server.close()
+            if self.connector_worker is not None:
+                self.connector_worker.shutdown()
 
     def configure_dspark_prefix_cache(self, vllm_config: VllmConfig) -> bool:
         """Opt the SFA DSpark producer into joint external prefix reuse.
@@ -286,13 +307,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_kv_caches(kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
-        """Fence the previous save before this step can reuse KV blocks.
+        """Fence only the saves of requests whose blocks this step may reuse.
 
-        This hook is temporarily reused for deferred KV cache save
-        synchronization and will be replaced by a dedicated mechanism.
+        Blocks are freed immediately when a request finishes or is preempted.
+        Before this step's forward can reallocate them, the in-flight puts of
+        exactly those requests are awaited (released_req_ids carried in the
+        connector metadata), instead of the whole previous save batch.
         """
         assert self.connector_worker is not None
-        self.connector_worker.wait_for_previous_save()
+        released_req_ids = getattr(kv_connector_metadata, "released_req_ids", None)
+        self.connector_worker.handle_released_saves(released_req_ids)
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         super().bind_connector_metadata(connector_metadata)
@@ -480,6 +504,10 @@ class LookupKeyServer:
 
         def process_request():
             while self.running:
+                if not self.socket.poll(timeout=_LOOKUP_SHUTDOWN_POLL_MS):
+                    continue
+                if not self.running:
+                    break
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
                 kv_group_ids = self.decoder.decode([all_frames[1]])
@@ -505,4 +533,7 @@ class LookupKeyServer:
         self.thread.start()
 
     def close(self):
+        self.running = False
+        self.thread.join()
         self.socket.close(linger=0)
+        self.ctx.term()

@@ -19,6 +19,7 @@
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -42,6 +43,7 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
 )
+from vllm.v1.worker.gpu.kv_connector import KVConnector
 from vllm.v1.worker.gpu.model_runner import (
     BatchReqState,
     ExecuteModelState,
@@ -58,8 +60,13 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
+from vllm_ascend.attention.attention_c8_mxfp import (
+    AscendC8MXFPAttentionBackendImpl,
+    fill_mxfp_v_scale_cache,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
+from vllm_ascend.attention.mla_v1 import AscendMLABackend, all_mla_use_flashmla
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -87,8 +94,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
+    is_c8_mxfp_kv_quant,
     is_deepseek_v41,
-    is_pd_decode_recompute_scheduler_enabled,
     lmhead_tp_enable,
     lmhead_tp_max_num_logits,
     lmhead_tp_pad_rows,
@@ -104,6 +111,7 @@ from vllm_ascend.worker.v2.attn_utils import (
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import (
@@ -116,6 +124,8 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
+    AscendV2KVBlockZeroer,
+    C8KVBlockZeroer,
     prepare_v41_dummy_ring_state,
     prepare_v41_source_rope,
     torch_cuda_wrapper,
@@ -126,14 +136,17 @@ class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
     # vLLM #51718 overlays hybrid Attention/Mamba groups in one standardized
-    # backing allocation. Ascend MRV2 preserves that layout in
-    # allocate_kv_cache_main and exposes contiguous backend-specific views.
+    # backing allocation. Ascend MRV2 preserves that allocation and exposes
+    # backend-specific views; MLA may use a page-strided fused/component view.
     supports_standardized_shared_kv_backing = True
 
     execute_model_state: ExecuteModelState | None
+    kv_connector: KVConnector
     max_num_reqs: int
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # Keep exact host counts until all active consumers are known.
+        self._skip_spec_cpu_length_sync = False
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         self.sparse_kv_offload_manager = None
@@ -141,6 +154,7 @@ class NPUModelRunner(GPUModelRunner):
         # Adaptive verification uses this flag to apply FIA-specific query
         # boundary and sequence length padding during FULL graph execution.
         self.use_fia = False
+        self._uses_flashmla = False
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -262,6 +276,26 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
 
+        # msprobe dump (same as v1 NPUModelRunner; not via DFX).
+        dump_cfg = self.ascend_config.dump_config_path
+        self.debugger = None
+        if dump_cfg is not None:
+            self._debugger_started = False
+            if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+                from msprobe.pytorch import PrecisionDebugger
+
+                self.debugger = PrecisionDebugger(dump_cfg)
+            else:
+                try:
+                    from msprobe.pytorch import AclGraphDumper
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Failed to import AclGraphDumper from msprobe. "
+                        "Please install/rebuild msprobe with aclgraph_dump enabled."
+                    ) from exc
+
+                self.debugger = AclGraphDumper(dump_cfg)
+
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
@@ -270,6 +304,11 @@ class NPUModelRunner(GPUModelRunner):
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
         self.pd_dspark_aux_layer_ids = aux_layers
+        # In cudagraph modes the dumper must be started before graph capture so
+        # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
+        # the dumper at the end of load_model).
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            self._start_dump_data()
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -337,6 +376,19 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_drafts()
+        # Close the per-step msprobe dump cycle on the normal last-PP-rank
+        # path (v1 parity: v1 finalizes at the end of sample_tokens).
+        self._finalize_dump_data()
+        return output
+
+    def pool(self):
+        output = super().pool()
+        # Pooling models never go through sample_tokens() in the v2
+        # architecture: the worker calls pool() directly, and the engine skips
+        # sampling whenever execute_model()/pool() returns a non-None output.
+        # Close the dump cycle here, mirroring v1 which finalizes after
+        # _pool() on the pooling path.
+        self._finalize_dump_data()
         return output
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -349,11 +401,30 @@ class NPUModelRunner(GPUModelRunner):
             shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
         )
 
+    def _init_kv_zero_meta(self) -> None:
+        """Use a tuple-aware zeroer for Ascend V1-compatible cache protocols."""
+        self.kv_block_zeroer = AscendV2KVBlockZeroer(
+            self.device,
+            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+            kernel_block_sizes=self.kernel_block_sizes,
+            static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
+            cache_dtype=self.cache_config.cache_dtype,
+        )
+        if is_c8_mxfp_kv_quant(self.vllm_config):
+            # The zeroer skips the static V scales (4th tuple component); the
+            # wrapper restores them on pages reassigned from Mamba.
+            self.kv_block_zeroer = C8KVBlockZeroer(  # type: ignore[assignment]
+                self.kv_block_zeroer, self._c8_mxfp_v_scale_caches, fill_mxfp_v_scale_cache
+            )
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
+        # Reinitialization can change the active attention backends.
+        self._skip_spec_cpu_length_sync = False
         # Match V1's physical buffer plan without mutating the scheduler's
         # logical cache configuration. Allocation must honor zero-stride aliases.
         kv_cache_config = deepcopy(kv_cache_config)
@@ -387,10 +458,16 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+            self._uses_flashmla = any(
+                getattr(group.get_metadata_builder(0), "flashmla_state", None) is not None
+                for groups in self.attn_groups
+                for group in groups
+            )
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
                 self.pcp_manager.kv_cache_config = kv_cache_config
+                self.pcp_manager.global_input_buffers = self.input_buffers
                 self.model_state.pcp_manager = self.pcp_manager
                 if self.speculator is not None:
                     self.speculator.pcp_manager = self.pcp_manager
@@ -429,6 +506,14 @@ class NPUModelRunner(GPUModelRunner):
             self.vllm_config.scheduler_config.max_num_seqs,
         )
 
+        copy_mamba_state = getattr(self.model_state, "copy_state_after_kv_load", None)
+        if (
+            callable(copy_mamba_state)
+            and has_kv_transfer_group()
+            and getattr(get_kv_transfer_group(), "requires_mamba_state_copy_after_load", False)
+        ):
+            self.kv_connector = MambaCopyKVConnector(self.kv_connector, copy_mamba_state)
+
         # Only target-model layers determine whether FIA is in use. This flag
         # is used for adaptive verification handling.
         draft_layer_names: set[str] = getattr(self.speculator, "draft_attn_layer_names", set())
@@ -450,6 +535,36 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+        self._skip_spec_cpu_length_sync = self._can_skip_spec_cpu_length_sync()
+        logger.info("Speculative CPU length synchronization bypass enabled: %s", self._skip_spec_cpu_length_sync)
+
+        self._fill_c8_mxfp_v_scale_caches()
+
+    def _fill_c8_mxfp_v_scale_caches(self) -> None:
+        """Initialize C8 V scales and retain views for page reassignment."""
+        self._c8_mxfp_v_scale_caches = []
+        num_blocks = self.kv_cache_config.num_blocks
+        if num_blocks <= 0:
+            return
+        for layer in self.compilation_config.static_forward_context.values():
+            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
+                value_scale_cache = layer.kv_cache[3]
+                assert value_scale_cache.shape[0] % num_blocks == 0
+                kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
+                self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
+                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
+
+    def shutdown(self) -> None:
+        # Drop C8 packet views before the parent collects tensors and
+        # empties the allocator cache.
+        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
+        if entries is not None:
+            entries.clear()
+        zeroer = getattr(self, "kv_block_zeroer", None)
+        if isinstance(zeroer, C8KVBlockZeroer):
+            zeroer.entries.clear()
+            self.kv_block_zeroer = zeroer.delegate
+        super().shutdown()
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
@@ -506,6 +621,13 @@ class NPUModelRunner(GPUModelRunner):
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        dump_forward = dummy_run or scheduler_output.total_num_scheduled_tokens > 0
+        # Eager PrecisionDebugger is started only for real scheduler steps.
+        # Graph dumping is already active from load_model(), so dummy forwards
+        # only need to flush the graph dumper below without writing a step.
+        if dump_forward and not dummy_run:
+            self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
+
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
         dp_coordination_context = (
             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
@@ -545,10 +667,34 @@ class NPUModelRunner(GPUModelRunner):
             self.model.compute_logits(self.execute_model_state.hidden_states[dummy_indices])
         self.kvpp.complete_forward()
 
+        if dump_forward:
+            if dummy_run:
+                self._finalize_dump_data(dump=False)
+            elif isinstance(output, IntermediateTensors) and self.is_pooling_model:
+                # Non-last pooling ranks do not reach pool(). Decoding ranks
+                # finalize after sample_tokens(), including non-last PP ranks.
+                self._finalize_dump_data()
+
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
             execution_start_time,
         )
+
+        # TODO: Remove this workaround once upstream vLLM restores idle DP ranks'
+        # logical request counts before draft DP synchronization.
+        # In adaptive verification, idle DP ranks dummy-run at target graph capacity.
+        # Restore their request counts before draft DP sync to avoid inflating all ranks.
+        if (
+            dummy_run
+            and not is_profile
+            and context_len == 0
+            and self.adaptive_verification is not None
+            and self.execute_model_state is not None
+        ):
+            state = self.execute_model_state
+            self.execute_model_state = state._replace(
+                input_batch=replace(state.input_batch, num_reqs=len(scheduler_output.num_scheduled_tokens))
+            )
         return output
 
     def _maybe_send_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
@@ -604,7 +750,9 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
-        if batch_state is not None and is_pd_decode_recompute_scheduler_enabled(self.vllm_config):
+        kv_cfg = self.vllm_config.kv_transfer_config
+        is_pd_decode_node = kv_cfg is not None and kv_cfg.is_kv_consumer and not kv_cfg.is_kv_producer
+        if batch_state is not None and is_pd_decode_node:
             pd_decode_recompute = (
                 batch_state.is_prefilling_np
                 & (batch_state.num_computed_prefill_tokens_np > 0)
@@ -623,6 +771,9 @@ class NPUModelRunner(GPUModelRunner):
                     int(batch_state.num_scheduled_tokens.max()),
                     batch_state.has_prefill,
                 )
+        if self._uses_flashmla and batch_state is not None:
+            # The backend order must precede derived inputs and graph dispatch.
+            batch_state, uniform_token_count = prepare_flashmla_batch_req_state(batch_state, uniform_token_count)
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -648,6 +799,13 @@ class NPUModelRunner(GPUModelRunner):
         self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+        graph_num_reqs = batch_desc.num_reqs
+        global_graph_num_reqs = (
+            self.pcp_manager.get_global_graph_num_reqs(batch_desc) if self.pcp_manager is not None else None
+        )
+        if global_graph_num_reqs is not None:
+            graph_num_reqs = global_graph_num_reqs
+            num_tokens_after_padding = global_graph_num_reqs * batch_desc.uniform_token_count
         assert num_tokens > 0
 
         req_ids = batch_req_state.req_ids
@@ -715,7 +873,8 @@ class NPUModelRunner(GPUModelRunner):
         # Get query_start_loc.
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        # Inputs are still global here; eager PCP descriptors carry local counts.
+        num_reqs_padded = max(num_reqs, graph_num_reqs or 0)
         query_start_loc_np = np.empty(self.max_num_reqs + 2, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
@@ -731,7 +890,8 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs,
                 query_start_loc_np,
                 batch_desc.cg_mode,
-                batch_desc.num_reqs,
+                graph_num_reqs,
+                uniform_query_len=batch_desc.uniform_token_count,
             )
 
         query_start_loc = self.input_buffers.query_start_loc
@@ -797,7 +957,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
 
         # Pad for full CUDA graph mode.
-        self.input_buffers.seq_lens_np[num_reqs_padded:] = 0
+        self.input_buffers.seq_lens_np[num_reqs:] = 0
 
         dcp_local_seq_lens = None
         # Main computes DCP lengths in the inherited execute_model after PCP
@@ -891,7 +1051,14 @@ class NPUModelRunner(GPUModelRunner):
             valid_state_slots=valid_state_slots,
         )
         prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
+        slot_mappings = self._maybe_extend_slot_mappings(input_batch, slot_mappings)
         return block_tables, slot_mappings
+
+    def _maybe_extend_slot_mappings(self, input_batch: AscendInputBatch, slot_mappings: torch.Tensor) -> torch.Tensor:
+        if input_batch.num_tokens_after_padding > input_batch.num_tokens:
+            # The parent already filled the entire persistent slot buffer.
+            slot_mappings = self.block_tables.slot_mappings[:, : input_batch.num_tokens_after_padding]
+        return slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity every rank agrees on (config-derived:
@@ -947,9 +1114,7 @@ class NPUModelRunner(GPUModelRunner):
 
     @contextmanager
     def _cap_parallel_draft_dummy_reqs(self, uniform_decode: bool):
-        # TODO: Remove this context and its use once main2main includes
-        # https://github.com/vllm-project/vllm/pull/56448. Until then,
-        # profiling can exceed the speculator's query buffer.
+        # Profiling can exceed the speculator's query buffer.
         original_max_num_reqs = self.max_num_reqs
         if self.speculator is not None and not uniform_decode:
             # Other speculators use one query row per request in vLLM v0.30.0.
@@ -959,6 +1124,50 @@ class NPUModelRunner(GPUModelRunner):
             yield
         finally:
             self.max_num_reqs = original_max_num_reqs
+
+    @contextmanager
+    def _preserve_dummy_query_tokens(self, num_tokens: int, uniform_decode: bool):
+        dummy_query_tokens: int | None = None
+        if (
+            # FULL modes can also pad requests; only change token-only PIECEWISE padding.
+            self.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+            # PCP prepares and partitions its own dummy input layout.
+            and self.pcp_manager is None
+            # Hybrid models also need recurrent-state metadata to stay aligned.
+            # TODO: Verify whether this hybrid-model guard can be removed.
+            and not self.model_config.is_hybrid
+        ):
+            # Match the logical token count in the upstream dummy scheduler.
+            dummy_query_tokens = max(num_tokens, self.decode_query_len) if uniform_decode else num_tokens
+
+        previous_dummy_tokens = self.input_buffers.dummy_num_tokens
+        self.input_buffers.dummy_num_tokens = dummy_query_tokens
+        try:
+            yield
+        finally:
+            self.input_buffers.dummy_num_tokens = previous_dummy_tokens
+
+    @contextmanager
+    def _cpp_profile_dummy(self, enabled: bool):
+        """Scope the target-only prefill semantics used by CPP profiling."""
+        if not enabled:
+            yield
+            return
+
+        previous_profile_cpp = getattr(self.input_buffers, "profile_cpp", False)
+        previous_speculator = self.speculator
+        previous_max_num_reqs = self.max_num_reqs
+        try:
+            self.input_buffers.profile_cpp = True
+            # CPP profiles the target prefill. This also matches MRV1, where the
+            # drafter dummy run is explicitly skipped for profile_cpp.
+            self.speculator = None
+            self.max_num_reqs = 1
+            yield
+        finally:
+            self.input_buffers.profile_cpp = previous_profile_cpp
+            self.speculator = previous_speculator
+            self.max_num_reqs = previous_max_num_reqs
 
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
@@ -970,6 +1179,7 @@ class NPUModelRunner(GPUModelRunner):
         context_len: int = 0,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        profile_cpp: bool = False,
         **kwargs,
     ):
         """Balanced dummy routing for adaptive-verification profiling; EPLB
@@ -987,8 +1197,18 @@ class NPUModelRunner(GPUModelRunner):
                 "the profile-run marker, which makes XLite bypass its graph path."
             )
         load_balance_ctx = override_mrv2_in_profile_run(True) if profile_adaptive_tail else nullcontext()
-        with self._cap_parallel_draft_dummy_reqs(uniform_decode), skip_ring_state_update(skip_ring), load_balance_ctx:
-            return super()._dummy_run(
+        with (
+            # Disable the CPP drafter before entering contexts that inspect it.
+            self._cpp_profile_dummy(profile_cpp),
+            # Preserve scheduled query tokens before PIECEWISE graph padding.
+            self._preserve_dummy_query_tokens(num_tokens, uniform_decode),
+            # TODO: Remove this context and its use after the next main2main
+            # includes https://github.com/vllm-project/vllm/pull/56448.
+            self._cap_parallel_draft_dummy_reqs(uniform_decode),
+            skip_ring_state_update(skip_ring),
+            load_balance_ctx,
+        ):
+            output = super()._dummy_run(
                 num_tokens,
                 *args,
                 skip_attn=skip_attn,
@@ -998,6 +1218,32 @@ class NPUModelRunner(GPUModelRunner):
                 is_profile=is_profile,
                 **kwargs,
             )
+        # Flush the dump window opened across dummy forwards without writing
+        # data, so capture/profiling forwards do not leak into the first real
+        # step (v1 parity: v1 finalizes with dump=False at the end of
+        # _dummy_run).
+        self._finalize_dump_data(dump=False)
+        return output
+
+    def _can_skip_spec_cpu_length_sync(self) -> bool:
+        """Use device lengths for K3/DSpark FlashMLA, including DCP."""
+        parallel = self.vllm_config.parallel_config
+        if (
+            self.model_config.architecture
+            not in {"KimiLinearForCausalLM", "KimiK3ForCausalLM", "KimiK3ForConditionalGeneration"}
+            or not getattr(self.speculator, "_draft_mla_uses_device_lengths", False)
+            # PP/PCP and offload paths have not been audited for host readers.
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or self.adaptive_verification is not None
+            or self.ascend_config.sparse_kv_offload_config.enabled
+            or self.ascend_config.kvpp_config.size != 1
+        ):
+            return False
+
+        # FlashMLA derives DCP-local lengths from rejection-corrected device
+        # counters. K3's non-MLA attention uses the KDA device-length path.
+        return all_mla_use_flashmla(self.model)
 
     def postprocess_sampled(
         self,
@@ -1007,10 +1253,7 @@ class NPUModelRunner(GPUModelRunner):
         num_rejected,
         query_start_loc=None,
     ):
-        """Override GPUModelRunner.postprocess_sampled for Ascend NPUs.
-        npu attention backends need seq_lens_cpu to work.
-        so we need to copy num_computed_tokens back to cpu here.
-        """
+        """Refresh rejection-corrected host counts when a consumer needs them."""
         if (
             self.use_pp
             and not self.is_last_pp_rank
@@ -1029,9 +1272,8 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # TODO: Gate CPU length synchronization by backend requirements, not
-        # speculative decoding alone. V4.1 uses device lengths; extend this
-        # exemption to other backends that do not need exact CPU seq_lens.
+        # The copy helper skips D2H only when both target and draft
+        # backends are on the audited device-length path.
         # Non-last PP stages receive rejections without owning a speculator.
         if (
             self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
@@ -1045,6 +1287,8 @@ class NPUModelRunner(GPUModelRunner):
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
+        if self._skip_spec_cpu_length_sync:
+            return
         # Attention metadata still needs exact CPU lengths. This non-blocking
         # D2H is waited on in _update_seq_lens_cpu, introducing a host/device
         # sync point that can break asynchronous scheduling overlap.
@@ -1066,12 +1310,12 @@ class NPUModelRunner(GPUModelRunner):
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
-        # Speculative decoding needs corrected num_computed_tokens after rejection.
-        # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
-        # so this update also corrects the num_computed_tokens_np used by PCP.
-        if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
-        ) or self.sync_spec_pp_cpu_counts:
+        # Keep the exact host mirror for consumers such as FIA and PCP.
+        # Device-length backends retain the scheduler's CPU upper bound.
+        if not self._skip_spec_cpu_length_sync and (
+            (self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config))
+            or self.sync_spec_pp_cpu_counts
+        ):
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
@@ -1093,6 +1337,7 @@ class NPUModelRunner(GPUModelRunner):
         query_start_loc_np: np.ndarray,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
+        uniform_query_len: int | None = None,
     ) -> tuple[np.ndarray, int]:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
@@ -1101,11 +1346,12 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         descriptor_num_reqs = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs_padded
+        query_len = uniform_query_len or self.decode_query_len
         # This checks query lengths, not request phase: short prefills can also
         # match. Graph dispatch is responsible for excluding incompatible prefills.
-        has_uniform_decode_query_lens = np.all(np.diff(query_start_loc_np[: num_reqs + 1]) == self.decode_query_len)
+        has_uniform_decode_query_lens = np.all(np.diff(query_start_loc_np[: num_reqs + 1]) == query_len)
         matches_uniform_decode_graph_shape = (
-            has_uniform_decode_query_lens and num_tokens_padded == descriptor_num_reqs * self.decode_query_len
+            has_uniform_decode_query_lens and num_tokens_padded == descriptor_num_reqs * query_len
         )
         if (
             cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -1120,13 +1366,13 @@ class NPUModelRunner(GPUModelRunner):
             # topology between capture and replay.
             num_reqs_padded = descriptor_num_reqs
 
-        if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * self.decode_query_len:
+        if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 
             last_loc = query_start_loc_np[num_reqs]
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
-                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
+                np.arange(1, num_reqs_padded + 1 - num_reqs) * query_len + last_loc
             )
         else:
             # Mixed-batch case: num_reqs must equal num_reqs_padded
@@ -1137,6 +1383,21 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs_padded = num_reqs_padded + 1
 
         return query_start_loc_np, num_reqs_padded
+
+    def _start_dump_data(self, **kwargs) -> None:
+        if self.debugger is None or self._debugger_started:
+            return
+        self.debugger.start(self.model, **kwargs)
+        self._debugger_started = True
+
+    def _finalize_dump_data(self, **kwargs) -> None:
+        if self.debugger is None or not self._debugger_started:
+            return
+        if hasattr(self.debugger, "stop"):
+            self.debugger.stop()
+            self._debugger_started = False
+
+        self.debugger.step(**kwargs)
 
     def _pad_adaptive_query_start_loc_for_fia(
         self,

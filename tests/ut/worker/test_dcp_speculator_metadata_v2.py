@@ -76,6 +76,10 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     manager.vllm_config = config
     cls = AscendDSparkSpeculator if kind == "dspark" else AscendMTPSpeculator
     spec = object.__new__(cls)
+    if kind == "dspark":
+        spec._draft_mla_uses_device_lengths = False
+    spec.replicated_pcp = False
+    spec.enable_adaptive_verification = False
     if kind == "mtp":
         spec._sparse_kv_offload_metadata = SimpleNamespace(build_kwargs=lambda *args: None)
         spec.model_state = object()

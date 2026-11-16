@@ -215,7 +215,7 @@ def test_fused_bfg_projection_preserves_staged_outputs():
     torch.testing.assert_close(output_gate, fused_output[:, 8:].reshape(4, 2, 3))
 
 
-def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
+def test_mixed_forward_uses_overlapped_projection():
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)
     attention.uses_mixed_projection = True
@@ -235,6 +235,7 @@ def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
     actual = attention.forward(hidden_states, positions)
 
     assert actual is projected
+    attention._run_overlapped_qkv_bfg.assert_called_once_with(hidden_states)
     assert attention._forward.call_args.kwargs["beta"] is beta
     assert attention._forward.call_args.kwargs["beta_is_preprocessed"] is True
 
@@ -403,7 +404,7 @@ def test_prefill_fuses_raw_gate_and_updates_v_first_state(lower_bound):
     chunk_kda_fwd = MagicMock(return_value=(output, final_state, *([None] * 10)))
 
     with (
-        patch("vllm_ascend.ops.kda.l2norm_fwd", side_effect=lambda x: x),
+        patch("vllm.third_party.flash_linear_attention.ops.l2norm.l2norm_fwd", side_effect=lambda x: x),
         patch("vllm_ascend.ops.kda.chunk_kda_fwd", new=chunk_kda_fwd),
     ):
         actual = attention._run_prefill(

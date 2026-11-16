@@ -371,6 +371,61 @@ def test_prepare_inputs_dispatches_to_310p_implementation() -> None:
     prepare_inputs_310p.assert_called_once_with(scheduler_output, batch_desc)
 
 
+def test_promote_mtp_spec_decoding_keeps_uniform_mtp_on_full_graph() -> None:
+    """Uniform MTP promote to SpecDecoding; non-uniform stays eager-eligible."""
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+    runner.decode_query_len = 2
+    num_valid = np.array([1, 1], dtype=np.int32)
+
+    # Helper: uniform verify must become SpecDecoding after #17461 ChunkedPrefill.
+    assert (
+        runner._promote_mtp_spec_decoding_attn_state(
+            AscendAttentionState.ChunkedPrefill,
+            num_reqs=2,
+            num_scheduled_tokens=np.array([2, 2], dtype=np.int32),
+            num_valid_tokens=num_valid,
+        )
+        == AscendAttentionState.SpecDecoding
+    )
+    # Helper: mixed lengths must not promote (remain ChunkedPrefill → eager).
+    assert (
+        runner._promote_mtp_spec_decoding_attn_state(
+            AscendAttentionState.ChunkedPrefill,
+            num_reqs=2,
+            num_scheduled_tokens=np.array([2, 3], dtype=np.int32),
+            num_valid_tokens=num_valid,
+        )
+        == AscendAttentionState.ChunkedPrefill
+    )
+
+    # Eager gate must call promote: uniform MTP + ChunkedPrefill → not force eager.
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
+    )
+    runner.kv_cache_config = None
+    runner.vllm_config = _make_vllm_config(speculative_config=runner.speculative_config)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"r0": 0},
+        num_computed_tokens_np=np.array([128], dtype=np.int32),
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"r0": 2},
+        scheduled_spec_decode_tokens={"r0": [7]},
+        total_num_scheduled_tokens=2,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=None,
+    )
+    with patch.object(
+        model_runner_module,
+        "build_attn_state",
+        return_value=AscendAttentionState.ChunkedPrefill,
+    ):
+        assert runner._scheduler_output_needs_spec_eager(scheduler_output) is False
+
+
 def test_post_update_cpu_matches_upstream_bookkeeping() -> None:
     idx_mapping_np = np.array([1, 0], dtype=np.int32)
     query_start_loc_np = np.array([0, 2, 4], dtype=np.int32)
@@ -951,3 +1006,52 @@ def test_worker_selects_v2_runner_on_310p() -> None:
     with patch("vllm_ascend._310p.worker.v2.model_runner.NPUModelRunner310V2") as runner_cls:
         worker.model_runner = worker._create_model_runner()
     runner_cls.assert_called_once_with(worker.vllm_config, worker.device)
+
+
+@pytest.mark.parametrize(
+    ("block_sizes", "head_sizes", "expected_kernel_size"),
+    [([64], [128], 64), ([128], [128], 128), ([128], [256], 64), ([256], [128], 128), ([128, 64], [128, 128], 64)],
+)
+def test_adjust_kernel_block_sizes_respects_physical_blocks(block_sizes, head_sizes, expected_kernel_size):
+    class FakeAttentionSpec:
+        def __init__(self, block_size, head_size):
+            self.block_size = block_size
+            self.head_size = head_size
+
+    class FakeUniformTypeKVCacheSpecs:
+        def __init__(self, specs):
+            self.kv_cache_specs = dict(enumerate(specs))
+
+    specs = [FakeAttentionSpec(b, h) for b, h in zip(block_sizes, head_sizes)]
+    group_spec = specs[0] if len(specs) == 1 else FakeUniformTypeKVCacheSpecs(specs)
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.kernel_block_sizes = [128]
+    runner.attn_groups = [
+        [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
+    ]
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=group_spec)])
+    with (
+        patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
+        patch.object(model_runner_module, "UniformTypeKVCacheSpecs", FakeUniformTypeKVCacheSpecs),
+    ):
+        runner._adjust_kernel_block_sizes(config)
+    assert runner.kernel_block_sizes == [expected_kernel_size]
+    assert all(b % expected_kernel_size == 0 for b in block_sizes)
+
+
+def test_adjust_kernel_block_sizes_rejects_incompatible_physical_blocks():
+    class FakeAttentionSpec:
+        block_size = 96
+        head_size = 128
+
+    runner = object.__new__(NPUModelRunner310V2)
+    runner.kernel_block_sizes = [128]
+    runner.attn_groups = [
+        [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
+    ]
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=FakeAttentionSpec())])
+    with (
+        patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
+        pytest.raises(NotImplementedError, match="divides every attention cache block size"),
+    ):
+        runner._adjust_kernel_block_sizes(config)

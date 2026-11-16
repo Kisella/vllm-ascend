@@ -9,6 +9,7 @@ from vllm.config.model import ModelConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
+from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_ascend.patch.platform.patch_pp_mtp import (
     _apply_patch,
@@ -316,15 +317,14 @@ def test_pp_mtp_spec_tokens_are_written_from_model_runner_output_for_sync_and_as
 ):
     request = SimpleNamespace(
         spec_token_ids=[],
+        use_structured_output=False,
         structured_output_request=None,
         is_finished=lambda: False,
     )
     scheduler = SimpleNamespace(
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         requests={"req-0": request},
-        structured_output_manager=SimpleNamespace(
-            should_advance=lambda _request: False,
-        ),
+        structured_output_manager=StructuredOutputManager.__new__(StructuredOutputManager),
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-0": 1})
     model_runner_output = SimpleNamespace(
@@ -380,21 +380,97 @@ def test_pp_mtp_post_step_skips_inflight_batch():
     assert EngineCore.post_step(engine, True) is None
 
 
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        SimpleNamespace(kv_role="kv_producer"),
+        SimpleNamespace(is_kv_producer=True, is_kv_consumer=False),
+    ],
+    ids=["producer-role", "producer-flags"],
+)
+@pytest.mark.parametrize(
+    (
+        "use_pp",
+        "async_scheduling",
+        "use_v2_model_runner",
+        "use_spec_decode",
+        "has_batch_queue",
+        "model_executed",
+        "expected_skip",
+    ),
+    [
+        (True, False, False, True, True, True, True),
+        (True, True, False, True, True, True, False),
+        (True, False, True, True, True, True, False),
+        (False, False, False, True, True, True, False),
+        (True, False, False, False, True, True, False),
+        (True, False, False, True, False, True, False),
+        (True, False, False, True, True, False, False),
+    ],
+    ids=["sync-prefill", "async", "v2", "no-pp", "no-spec-decode", "no-batch-queue", "no-execution"],
+)
+def test_pd_prefill_post_step_guards(
+    monkeypatch,
+    kv_transfer_config,
+    use_pp,
+    async_scheduling,
+    use_v2_model_runner,
+    use_spec_decode,
+    has_batch_queue,
+    model_executed,
+    expected_skip,
+):
+    original_calls = []
+    original_result = object()
+
+    def original_post_step(engine, executed):
+        original_calls.append((engine, executed))
+        return original_result
+
+    monkeypatch.setattr(EngineCore, "post_step", original_post_step)
+    _patch_engine_core()
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=kv_transfer_config,
+        speculative_config=object() if use_spec_decode else None,
+        use_v2_model_runner=use_v2_model_runner,
+    )
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(vllm_config=vllm_config, use_pp=use_pp),
+        batch_queue=object() if has_batch_queue else None,
+        async_scheduling=async_scheduling,
+        use_spec_decode=use_spec_decode,
+    )
+
+    result = EngineCore.post_step(engine, model_executed)
+
+    if expected_skip:
+        assert result is None
+        assert original_calls == []
+    else:
+        assert result is original_result
+        assert original_calls == [(engine, model_executed)]
+    # Skipping draft feedback must not enable the sampled-token IPC path on P.
+    assert _use_pp_ipc_runtime_patch(vllm_config, use_pp) is False
+
+
 def test_pp_mtp_spec_token_id_edge_cases():
     finished = SimpleNamespace(is_finished=lambda: True, spec_token_ids=["keep"])
     grammar = SimpleNamespace(validate_tokens=lambda tokens: tokens[:1])
     advancing = SimpleNamespace(
         spec_token_ids=[],
         is_finished=lambda: False,
-        structured_output_request=SimpleNamespace(grammar=grammar),
+        use_structured_output=True,
+        structured_output_request=SimpleNamespace(grammar=grammar, reasoning_ended=True),
     )
     empty_sampled = SimpleNamespace(
         spec_token_ids=["keep"],
         is_finished=lambda: False,
     )
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.enable_in_reasoning = False
     scheduler = SimpleNamespace(
         requests={"fin": finished, "adv": advancing, "empty": empty_sampled},
-        structured_output_manager=SimpleNamespace(should_advance=lambda req: req is advancing),
+        structured_output_manager=manager,
     )
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"missing": 1, "fin": 1, "no-index": 1, "empty": 1, "adv": 1},
@@ -409,6 +485,38 @@ def test_pp_mtp_spec_token_id_edge_cases():
     assert finished.spec_token_ids == ["keep"]
     assert empty_sampled.spec_token_ids == []
     assert advancing.spec_token_ids == [401]
+
+
+def test_pp_mtp_spec_tokens_remain_unconstrained_during_reasoning(monkeypatch):
+    def validate_grammar(_tokens):
+        pytest.fail("Grammar must not constrain tokens before reasoning ends")
+
+    request = SimpleNamespace(
+        spec_token_ids=[],
+        is_finished=lambda: False,
+        use_structured_output=True,
+        all_token_ids=[200],
+        structured_output_request=SimpleNamespace(
+            grammar=SimpleNamespace(validate_tokens=validate_grammar),
+            reasoning_ended=False,
+        ),
+    )
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.enable_in_reasoning = False
+    monkeypatch.setattr(
+        manager,
+        "_get_reasoner",
+        lambda _request: SimpleNamespace(is_reasoning_end_streaming=lambda _ids, _tokens: False),
+    )
+    scheduler = SimpleNamespace(requests={"req-0": request}, structured_output_manager=manager)
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-0": 1})
+    model_runner_output = SimpleNamespace(
+        req_id_to_index={"req-0": 0}, sampled_token_ids=[[200]], spec_token_ids=[[301, 302]]
+    )
+
+    _update_pp_mtp_spec_token_ids(scheduler, scheduler_output, model_runner_output)
+
+    assert request.spec_token_ids == [301, 302]
 
 
 def test_pp_ipc_cached_request_data_skips_empty_output_tokens():

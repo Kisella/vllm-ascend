@@ -10,11 +10,12 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import AttentionConfig
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend, AscendDSAMetadata
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAImpl, all_mla_use_flashmla
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadata
 from vllm_ascend.models import kimi_k3_dspark
 from vllm_ascend.models.kimi_k3 import AscendKimiLinearModel
@@ -27,6 +28,9 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpec
 
 def make_speculator():
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec._draft_mla_uses_device_lengths = False
+    spec.replicated_pcp = False
+    spec.enable_adaptive_verification = False
     spec.attn_architecture = "MLA"
     spec.use_dcp = False
     spec.requires_non_causal = True
@@ -43,6 +47,34 @@ def make_speculator():
         positions=torch.arange(20), seq_lens=torch.tensor([5, 0, 0, 0], dtype=torch.int32)
     )
     return spec
+
+
+@pytest.mark.parametrize("replicated_pcp", [False, True])
+def test_dspark_sync_matches_global_draft_requests(monkeypatch, replicated_pcp):
+    spec = make_speculator()
+    spec.replicated_pcp = replicated_pcp
+    spec.max_num_reqs = 4
+    spec.max_num_tokens = 20
+    batch = SimpleNamespace(num_reqs=4, is_prefilling_np=np.zeros(4, dtype=np.bool_))
+    target_sync = SimpleNamespace(num_reqs=2 if replicated_pcp else 4)
+    monkeypatch.setattr(shared, "build_attn_metadata_wrapper", nullcontext)
+    monkeypatch.setattr(shared, "build_attn_metadata_factory", lambda *a, **kw: nullcontext())
+
+    def parent_propose(self, *args, **kwargs):
+        sync = args[11]
+        if sync is not None:
+            # Execute the actual upstream capacity check, not a duplicate of it.
+            self._build_uniform_batch_dp_sync(sync, batch.num_reqs, self.num_query_per_req)
+        assert (sync is None) == replicated_pcp
+        return "draft"
+
+    if not replicated_pcp:
+        # The helper replaces the real DP state after checking capacity.
+        target_sync = DPSyncState(
+            num_tokens_across_dp=torch.tensor([4, 4]), uniform_token_count=1, eager=False, num_reqs=4
+        )
+    monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
+    assert spec.propose(batch, *[None for _ in range(10)], dp_sync=target_sync) == "draft"
 
 
 def make_target():
@@ -81,15 +113,16 @@ def test_shared_speculator_selects_draft_backend(monkeypatch, target_backend, dr
     spec = initialize_attention(monkeypatch, draft_backend, target_backend)
     assert spec.attn_architecture == expected
     assert spec.attn_backends == {"draft": draft_backend}
+    assert spec._draft_mla_uses_device_lengths is False
 
 
-def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABackend):
+def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABackend, *, flashmla_layers=()):
     monkeypatch.setattr(draft_backend, "get_impl_cls", staticmethod(lambda: object))
     monkeypatch.setattr(DSparkSpeculator, "__init__", lambda self, config, device: setattr(self, "vllm_config", config))
     monkeypatch.setattr(shared, "prepare_replicated_pcp_config", lambda config: (config, False))
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
-        speculative_config=SimpleNamespace(method="dspark", use_dspark=lambda: True),
+        speculative_config=SimpleNamespace(method="dspark", enforce_eager=None, use_dspark=lambda: True),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         cache_config=SimpleNamespace(block_size=128),
     )
@@ -98,6 +131,14 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
     assert type(spec) is AscendDSparkSpeculator
     assert spec.attn_architecture is None
     spec.vllm_config = config
+    # A real module tree exercises the backend predicate without NPU kernels.
+    spec.model = torch.nn.Module()
+    for index, use_flashmla in enumerate(flashmla_layers):
+        layer = torch.nn.Module()
+        layer.impl = AscendMLAImpl.__new__(AscendMLAImpl)
+        if use_flashmla is not None:
+            layer.impl.use_flashmla = use_flashmla
+        spec.model.add_module(f"layer_{index}", layer)
     spec.draft_attn_layer_names = {"draft"}
     spec._context_slot_mappings = torch.zeros(1, dtype=torch.int64)
     target_groups = [[SimpleNamespace(backend=target_backend)]]
@@ -119,6 +160,15 @@ def initialize_attention(monkeypatch, draft_backend, target_backend=AscendMLABac
     spec.set_attn(None, cache_config, None, None, target_groups)
     assert spec._context_slot_mappings.dtype == torch.int32
     return spec
+
+
+@pytest.mark.parametrize("backend", [AscendMLABackend, DerivedMLABackend, AscendAttentionBackend])
+@pytest.mark.parametrize("flashmla_layers", [(), (True,), (True, True), (True, False), (None,)])
+def test_draft_device_lengths_require_all_mla_layers_to_use_flashmla(monkeypatch, backend, flashmla_layers):
+    spec = initialize_attention(monkeypatch, backend, flashmla_layers=flashmla_layers)
+    all_flashmla = bool(flashmla_layers) and all(value is True for value in flashmla_layers)
+    assert all_mla_use_flashmla(spec.model) is all_flashmla
+    assert spec._draft_mla_uses_device_lengths is (issubclass(backend, AscendMLABackend) and all_flashmla)
 
 
 @pytest.mark.parametrize(

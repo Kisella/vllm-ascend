@@ -136,6 +136,16 @@ class AscendModelState(DefaultModelState):
             "block_table": block_tables[group_id][: batch.num_reqs],
         }
 
+    def prepare_inputs_embeds(self, scheduled_encoder_inputs, input_batch, req_states) -> torch.Tensor:
+        # MRV2 prepares MM embeddings before entering ForwardContext. Upstream
+        # slices input_ids to valid local rows to match the image mask, leaving
+        # different input lengths on PCP ranks. Publish the common padded length
+        # (including graph padding) before that slice, and overwrite it each batch.
+        set_embedding_num_tokens_padded = getattr(self.model, "set_embedding_num_tokens_padded", None)
+        if set_embedding_num_tokens_padded is not None:
+            set_embedding_num_tokens_padded(input_batch.num_tokens_after_padding)
+        return super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
+
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
         model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
@@ -186,10 +196,12 @@ class AscendModelState(DefaultModelState):
             # Piecewise cudagraphs and eager use the actual request count.
             num_reqs = input_batch.num_reqs
 
-        if cudagraph_mode == CUDAGraphMode.FULL or self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
-            # PCP pads each rank to the largest rank-local token count even
-            # during eager prefill, so token-shaped metadata must match the
-            # padded model input.
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL
+            or self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+            or (cudagraph_mode == CUDAGraphMode.PIECEWISE and input_batch.is_dummy)
+        ):
+            # Token-shaped metadata must match the padded model inputs.
             num_input_tokens = input_batch.num_tokens_after_padding
         else:
             num_input_tokens = input_batch.num_tokens
