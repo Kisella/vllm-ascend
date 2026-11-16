@@ -87,6 +87,15 @@ _CUSTOM_OP_BASE_DIR = (
 _IS_ROT_WEIGHT_USED = None
 
 
+def is_gqa_pcp_dcp_config(model_config: Any, parallel_config: Any) -> bool:
+    """Whether a GQA/MQA model enables both PCP and DCP."""
+    return (
+        parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size > 1
+        and not model_config.use_mla
+    )
+
+
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
     """Extract DSV4 index for config per-layer arrays.
 
@@ -828,7 +837,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
     from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
     from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
-    from vllm_ascend.ops.layernorm import AscendFusedRMSNormGated, AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
         AscendMergedColumnParallelLinear,
@@ -858,7 +867,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     REGISTERED_ASCEND_OPS = {
         "QuickGELU": AscendQuickGELU,
         "SiluAndMul": AscendSiluAndMul,
-        "SiluAndMulClamp": AscendSiluAndMulWithClamp,
+        "SiluAndMulWithClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
         "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
@@ -878,7 +887,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "MMEncoderAttention": AscendMMEncoderAttention,
         "ApplyRotaryEmb": AscendApplyRotaryEmb,
         "RMSNormGated": AscendRMSNormGated,
-        "FusedRMSNormGated": AscendFusedRMSNormGated,
         "Conv3dLayer": AscendConv3dLayer,
         "RelPosAttention": AscendRelPosAttention,
         "CustomQwen2Decoder": AscendCustomQwen2Decoder,
@@ -946,6 +954,22 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
+def register_ascend_fla_customop():
+    """Resolve the FLA subclass after selecting a device, before model loading.
+
+    Registration happens once inside the imported module, under Python's
+    module import lock. Repeated calls keep the same class and registry key.
+    """
+    # Separate this from general registration to avoid FLA initializing an NPU
+    # context during plugin discovery in the API process.
+    # TODO: Merge back into register_ascend_customop once supported vLLM FLA or
+    # Triton Ascend versions fix import-time NPU initialization.
+    from vllm_ascend.ops.fused_rms_norm_gated import AscendFusedRMSNormGated
+
+    REGISTERED_ASCEND_OPS["FusedRMSNormGated"] = AscendFusedRMSNormGated
+    return AscendFusedRMSNormGated
+
+
 def lmhead_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 0
 
@@ -978,7 +1002,7 @@ def embedding_tp_enable() -> bool:
 
 
 def oproj_tp_enable() -> bool:
-    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 0
+    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 1
 
 
 def mlp_tp_enable() -> bool:
@@ -998,6 +1022,20 @@ def enable_sp(vllm_config=None) -> bool:
         return False
 
     return bool(vllm_config.parallel_config.use_sequence_parallel_moe)
+
+
+def pad_sequence_parallel_tokens(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Pad the token dim of ``hidden_states`` up to the TP size.
+
+    Always call pad(), even with zero padding, to avoid specializing the
+    padding branch during tracing.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = get_tensor_model_parallel_world_size()
+    padding = (-hidden_states.shape[0]) % tp_size
+    pad = (0, 0) * (hidden_states.ndim - 1) + (0, padding)
+    return torch.nn.functional.pad(hidden_states, pad)
 
 
 # TODO remove it after vllm has this func
@@ -1369,7 +1407,10 @@ C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
 
 
 def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
-    return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+    # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
+    # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
 
 
 def refresh_block_size(vllm_config):
@@ -1825,13 +1866,12 @@ def is_rot_weight_used(vllm_config: VllmConfig = None):
 
 
 def enable_sfa(vllm_config) -> bool:
+    """Whether the model uses SFA for its main attention cache."""
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:
         return False
     hf_text_config = getattr(model_config, "hf_text_config", None)
     if hf_text_config is None:
-        return False
-    if model_uses_kpool_indexer(model_config):
         return False
     return hasattr(hf_text_config, "index_topk") and not hasattr(hf_text_config, "compress_ratios")
 
