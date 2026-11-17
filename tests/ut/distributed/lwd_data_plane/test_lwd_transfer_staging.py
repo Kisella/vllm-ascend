@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from vllm_ascend.distributed.lwd_data_plane import lwd_channels
 from vllm_ascend.distributed.lwd_data_plane import lwd_transfer_queue as queue_module
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
