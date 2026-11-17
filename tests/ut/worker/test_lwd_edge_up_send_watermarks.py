@@ -20,6 +20,7 @@ from vllm.v1.core.sched.output import (  # noqa: E402
     LwdUnembedBatch,
     SchedulerOutput,
 )
+
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import (  # noqa: E402
     LwdTransferFuture,
 )
