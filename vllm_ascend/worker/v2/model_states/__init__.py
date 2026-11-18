@@ -22,8 +22,49 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import CrossAttention
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+
+
+def resolve_ascend_model_state_cls(
+    vllm_config: VllmConfig,
+    model: nn.Module,
+) -> type[ModelState]:
+    # Keep model-provided state overrides ahead of the platform defaults.
+    if hasattr(model, "get_model_state_cls"):
+        return model.get_model_state_cls()
+
+    # 310P uses Triton-free states under ``vllm_ascend._310p.worker.v2.model_state``.
+    if vllm_config.model_config.is_hybrid:
+        if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
+            from vllm_ascend._310p.worker.v2.model_state import Ascend310PMambaHybridModelState
+
+            return Ascend310PMambaHybridModelState
+
+        from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+            AscendMambaHybridModelState,
+        )
+
+        return AscendMambaHybridModelState
+
+    if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
+        from vllm_ascend._310p.worker.v2.model_state import (
+            Ascend310PModelState,
+        )
+
+        return Ascend310PModelState
+
+    if any(isinstance(module, CrossAttention) for module in model.modules()):
+        from vllm_ascend.worker.v2.model_states.encoder_decoder import (
+            AscendEncoderDecoderModelState,
+        )
+
+        return AscendEncoderDecoderModelState
+
+    from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+    return AscendModelState
 
 
 def init_asecnd_model_state(
@@ -31,75 +72,6 @@ def init_asecnd_model_state(
     model: nn.Module,
     encoder_cache: EncoderCache | None,
     device: torch.device,
-):
-    # Keep model-provided state overrides ahead of the platform defaults.
-    if hasattr(model, "get_model_state_cls"):
-        cls = model.get_model_state_cls()
-        return cls(vllm_config, model, encoder_cache, device)
-
-    # 310P uses Triton-free states under ``vllm_ascend._310p.worker.v2.model_state``.
-    if vllm_config.model_config.is_hybrid:
-        if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-            from vllm_ascend._310p.worker.v2.model_state import Ascend310PMambaHybridModelState
-
-            return Ascend310PMambaHybridModelState(vllm_config, model, encoder_cache, device)
-
-        lwd_config = getattr(vllm_config, "lwd_config", None)
-        if lwd_config is not None and lwd_config.role == "cloud":
-            from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
-                LwdAscendCloudMambaHybridModelState,
-            )
-
-            return LwdAscendCloudMambaHybridModelState(
-                vllm_config,
-                model,
-                encoder_cache,
-                device,
-            )
-
-        from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
-            AscendMambaHybridModelState,
-        )
-
-        return AscendMambaHybridModelState(
-            vllm_config,
-            model,
-            encoder_cache,
-            device,
-        )
-
-    if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-        from vllm_ascend._310p.worker.v2.model_state import (
-            Ascend310PModelState,
-        )
-
-        return Ascend310PModelState(
-            vllm_config,
-            model,
-            encoder_cache,
-            device,
-        )
-
-    if any(isinstance(module, CrossAttention) for module in model.modules()):
-        from vllm_ascend.worker.v2.model_states.encoder_decoder import (
-            AscendEncoderDecoderModelState,
-        )
-
-        return AscendEncoderDecoderModelState(
-            vllm_config,
-            model,
-            encoder_cache,
-            device,
-        )
-
-    lwd_config = getattr(vllm_config, "lwd_config", None)
-    if lwd_config is not None and lwd_config.role == "cloud":
-        from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
-            LwdAscendCloudModelState,
-        )
-
-        return LwdAscendCloudModelState(vllm_config, model, encoder_cache, device)
-
-    from vllm_ascend.worker.v2.model_states.default import AscendModelState
-
-    return AscendModelState(vllm_config, model, encoder_cache, device)
+) -> ModelState:
+    cls = resolve_ascend_model_state_cls(vllm_config, model)
+    return cls(vllm_config, model, encoder_cache, device)

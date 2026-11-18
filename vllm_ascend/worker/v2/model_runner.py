@@ -50,6 +50,7 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     GPUModelRunner,
 )
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -120,6 +121,10 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.worker.v2.model_states import (
+    init_asecnd_model_state,
+    resolve_ascend_model_state_cls,
+)
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
@@ -233,7 +238,7 @@ class NPUModelRunner(GPUModelRunner):
         # model-based methods through the Ascend factory.
         self.speculator: Any = None
         if self.speculative_config is not None and self.is_last_pp_rank:
-            self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
+            self.speculator = self.create_speculator()
             # Share the update stream between the target and draft graph managers.
             self.speculator.update_stream = self.update_stream
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
@@ -289,6 +294,20 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
+
+    def create_speculator(self) -> Any:
+        return init_speculator(self.vllm_config, self.device, self.req_states)
+
+    def resolve_model_state_cls(self, model: torch.nn.Module) -> type[ModelState]:
+        return resolve_ascend_model_state_cls(self.vllm_config, model)
+
+    def create_model_state(self) -> ModelState:
+        return init_asecnd_model_state(
+            self.vllm_config,
+            self.model,
+            self.encoder_cache,
+            self.device,
+        )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         from vllm_ascend.model_executor.warmup.nz_warmup import (

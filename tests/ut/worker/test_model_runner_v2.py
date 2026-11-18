@@ -909,9 +909,9 @@ def test_load_model_original_profiler_counts_post_load_weights(monkeypatch, with
     monkeypatch.setattr(vllm_model_runner, "DeviceMemoryProfiler", profile)
     monkeypatch.setattr(vllm_model_runner, "get_model_loader", lambda _config: SimpleNamespace(load_model=load_target))
     monkeypatch.setattr(
-        vllm_model_runner,
-        "init_model_state",
-        lambda *_args: SimpleNamespace(num_new_sampled_tokens_per_step=1),
+        NPUModelRunner,
+        "create_model_state",
+        lambda _self: SimpleNamespace(num_new_sampled_tokens_per_step=1),
     )
     monkeypatch.setattr(vllm_model_runner, "use_workspace_lane", lambda _lane: nullcontext())
     monkeypatch.setattr(vllm_model_runner, "get_offloader", NoopOffloader)

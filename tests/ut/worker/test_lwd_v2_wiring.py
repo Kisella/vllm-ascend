@@ -1,14 +1,19 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import torch
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.config.lwd import LwdConnectionId
 from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView
 
 from vllm_ascend.worker.lwd_cloud_model.v2.cloud_input import (
     LwdAscendCloudInputAssembler,
+)
+from vllm_ascend.worker.lwd_cloud_model.v2.model_runner import (
+    LwdAscendCloudModelRunnerV2,
 )
 
 
@@ -147,3 +152,18 @@ def test_mixed_connections_use_their_own_payload_and_lookahead_sources(monkeypat
     assert broadcasts[0][0].tolist() == [1.0, 2.0, 3.0, 4.0]
     assert broadcasts[2][0].tolist() == [10.0, 11.0, 12.0, 13.0]
     assert stage.consumed == 2
+
+
+def test_lwd_runner_selects_ascend_mtp_speculator(monkeypatch) -> None:
+    runner = LwdAscendCloudModelRunnerV2.__new__(LwdAscendCloudModelRunnerV2)
+    runner.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    runner.vllm_config.speculative_config = SimpleNamespace(method="mtp")
+    runner.device = torch.device("cpu")
+    runner.speculative_config = runner.vllm_config.speculative_config
+    speculator = Mock()
+    monkeypatch.setattr(
+        "vllm_ascend.worker.lwd_cloud_model.v2.model_runner.LwdAscendCloudMTPSpeculator",
+        Mock(return_value=speculator),
+    )
+
+    assert runner.create_speculator() is speculator

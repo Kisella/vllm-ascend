@@ -19,11 +19,13 @@ from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelStateMixin
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.worker.lwd_cloud_model.v2.model_runner import (
+    LwdAscendCloudModelRunnerV2,
+)
 from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
     LwdAscendCloudMambaHybridModelState,
     LwdAscendCloudModelState,
 )
-from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
@@ -102,16 +104,17 @@ def _cloud_config(tmp_path: Path, layer_type: str) -> VllmConfig:
 
 
 def _init_model_state(vllm_config: VllmConfig, model: torch.nn.Module) -> AscendModelState:
+    runner = LwdAscendCloudModelRunnerV2.__new__(LwdAscendCloudModelRunnerV2)
+    runner.vllm_config = vllm_config
+    runner.device = torch.device("cpu")
+    runner.model = model
+    runner.encoder_cache = None
+    runner.speculative_config = vllm_config.speculative_config
     with patch(
         "vllm_ascend.worker.v2.model_states.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A2),
     ):
-        return init_asecnd_model_state(
-            vllm_config,
-            model,
-            None,
-            torch.device("cpu"),
-        )
+        return runner.create_model_state()
 
 
 def test_qwen35_linear_attention_composes_lwd_and_mamba_state(tmp_path: Path) -> None:
