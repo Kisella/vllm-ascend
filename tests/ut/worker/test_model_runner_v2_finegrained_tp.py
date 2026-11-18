@@ -48,7 +48,11 @@ def _make_runner(max_num_reqs=8, decode_query_len=2, vocab=6):
     runner.is_last_pp_rank = True
     runner.execute_model_state = None
     runner.pcp_manager = None
-    runner.model_state = SimpleNamespace(kvpp_is_dummy_run=False)
+    runner.model_state = SimpleNamespace(
+        kvpp_is_dummy_run=False,
+        compute_sample_logits=lambda hidden_states: runner.model.compute_logits(hidden_states),
+        capture_sample_logits=lambda logits: None,
+    )
     runner.kvpp = MagicMock()
     runner.ascend_config = SimpleNamespace(scheduler_config=SimpleNamespace(profiling_chunk_config=None))
     runner.model = MagicMock()
