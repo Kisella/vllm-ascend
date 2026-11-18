@@ -44,6 +44,19 @@ def init_asecnd_model_state(
 
             return Ascend310PMambaHybridModelState(vllm_config, model, encoder_cache, device)
 
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None and lwd_config.role == "cloud":
+            from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
+                LwdAscendCloudMambaHybridModelState,
+            )
+
+            return LwdAscendCloudMambaHybridModelState(
+                vllm_config,
+                model,
+                encoder_cache,
+                device,
+            )
+
         from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
             AscendMambaHybridModelState,
         )
