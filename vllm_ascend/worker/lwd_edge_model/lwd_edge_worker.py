@@ -19,6 +19,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_execution import LwdEdgeExecutionMixin
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (
     LwdEdgeModelRunner,
 )
@@ -28,6 +29,18 @@ if TYPE_CHECKING:
     from vllm.v1.worker.worker_base import CompilationTimes
 
 
+def _resolve_lwd_edge_model_runner_cls(
+    use_v2_model_runner: bool,
+) -> type[LwdEdgeExecutionMixin]:
+    if use_v2_model_runner:
+        from vllm_ascend.worker.lwd_edge_model.v2.model_runner import (
+            LwdEdgeModelRunnerV2,
+        )
+
+        return LwdEdgeModelRunnerV2
+    return LwdEdgeModelRunner
+
+
 class LwdEdgeWorker(LwdWorkerBase):
     """LWD edge worker: batch dispatch only (embed/unembed on the runner)."""
 
@@ -35,8 +48,8 @@ class LwdEdgeWorker(LwdWorkerBase):
         # comm_service and group setup belong to the base init_device; see
         # LwdWorkerBase._init_lwd_data_plane。
         super().init_device()
-        # Swap in the edge runner (same pattern as the cloud side): embed/unembed compute lives in the runner.
-        self.model_runner = LwdEdgeModelRunner(
+        runner_cls = _resolve_lwd_edge_model_runner_cls(self.use_v2_model_runner)
+        self.model_runner = runner_cls(
             self.vllm_config,
             self.device,
             worker=self,
