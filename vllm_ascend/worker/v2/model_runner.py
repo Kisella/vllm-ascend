@@ -1129,7 +1129,14 @@ class NPUModelRunner(GPUModelRunner):
             capacity,
             "max_num_reqs * decode_query_len",
         )
-        logits = self.model_state.compute_sample_logits(hidden_states[sample_indices])
+        compute_sample_logits = getattr(
+            self.model_state,
+            "compute_sample_logits",
+            None,
+        )
+        if compute_sample_logits is None:
+            compute_sample_logits = self.model.compute_logits
+        logits = compute_sample_logits(hidden_states[sample_indices])
         logits = logits[:num_logits]
         capture_logits = getattr(self.model_state, "capture_lwd_sample_logits", None)
         if capture_logits is not None:
