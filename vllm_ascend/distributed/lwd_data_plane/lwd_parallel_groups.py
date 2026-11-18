@@ -44,10 +44,10 @@ def _lwd_check_ascend_features() -> None:
         for name, enabled in (
             ("KV layer parallelism", ascend_config.kvpp_config.size > 1),
             ("PD head ratio > 1", ascend_config.pd_head_ratio > 1),
-            ("finegrained oproj TP", finegrained.oproj_tensor_parallel_size > 0),
-            ("finegrained lmhead TP", finegrained.lmhead_tensor_parallel_size > 0),
-            ("finegrained embedding TP", finegrained.embedding_tensor_parallel_size > 0),
-            ("finegrained mlp TP", finegrained.mlp_tensor_parallel_size > 0),
+            ("finegrained oproj TP", finegrained.oproj_tensor_parallel_size > 1),
+            ("finegrained lmhead TP", finegrained.lmhead_tensor_parallel_size > 1),
+            ("finegrained embedding TP", finegrained.embedding_tensor_parallel_size > 1),
+            ("finegrained mlp TP", finegrained.mlp_tensor_parallel_size > 1),
         )
         if enabled
     ]
