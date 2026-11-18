@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.device import DeviceConfig
+from vllm.config.lwd import LwdConnectionId
 from vllm.forward_context import set_forward_context
 from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView
 from vllm.v1.worker.gpu.lwd.down_payload import LwdDownPayloadBuilder
@@ -111,7 +112,7 @@ def test_dummy_hash_batch_does_not_reuse_real_mask() -> None:
         assert not _EXTRA_CTX.input_ids.any()
 
 
-def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> None:
+def test_lmhead_tp_captures_trimmed_logits_and_routes_connections(monkeypatch) -> None:
     runner = LwdAscendCloudModelRunnerV2.__new__(LwdAscendCloudModelRunnerV2)
     model = _Model()
     state = LwdAscendCloudModelState.__new__(LwdAscendCloudModelState)
@@ -121,6 +122,12 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     runner._lwd_down_builder = LwdDownPayloadBuilder(torch.device("cpu"))
     runner.max_num_reqs = 2
     runner.decode_query_len = 2
+    runner.worker = SimpleNamespace(
+        _lwd_connections=[
+            LwdConnectionId(0, 0, 0),
+            LwdConnectionId(1, 0, 0),
+        ]
+    )
     sampler_output = SamplerOutput(
         sampled_token_ids=torch.tensor([[0], [1]]),
         logprobs_tensors=None,
@@ -132,7 +139,7 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     runner.rejection_sampler = None
     batch = SimpleNamespace(
         logits_indices=torch.tensor([1, 3]),
-        req_ids=["a", "b"],
+        req_ids=["e0-a", "e1-b"],
         idx_mapping_np=np.array([0, 1]),
         num_draft_tokens=0,
         num_draft_tokens_per_req=None,
@@ -140,7 +147,7 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     monkeypatch.setattr("vllm_ascend.worker.v2.model_runner.lmhead_tp_enable", lambda: True)
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.lwd.model_runner.get_tp_group",
-        lambda: SimpleNamespace(is_first_rank=True),
+        lambda: SimpleNamespace(is_first_rank=False, rank_in_group=0),
     )
     monkeypatch.setattr("torch.cuda.Event", lambda: SimpleNamespace(record=lambda: None))
 
@@ -151,3 +158,8 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     assert captured is not None
     assert captured.tolist() == [[4, 6], [12, 14]]
     assert runner.sampler.call_args.args[0] is captured
+    payloads = runner.take_lwd_pending_down_payload()
+    assert payloads is not None
+    assert [payload.connection.edge_id for payload in payloads] == [0, 1]
+    assert [payload.req_ids for payload in payloads] == [["e0-a"], ["e1-b"]]
+    assert [payload.hidden.tolist() for payload in payloads] == [[[2, 3]], [[6, 7]]]

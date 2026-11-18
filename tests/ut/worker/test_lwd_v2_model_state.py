@@ -177,7 +177,7 @@ def test_cloud_leader_broadcasts_staged_prompt_window(tmp_path: Path, monkeypatc
     vllm_config = _cloud_config(tmp_path, "full_attention")
     state = LwdAscendCloudModelState(vllm_config, torch.nn.Module(), None, torch.device("cpu"))
     stage = _PromptStage(torch.arange(1, 9, dtype=torch.bfloat16))
-    state.bind_lwd_prompt_stage(stage)
+    state.bind_lwd_prompt_stage(stage, local_rank=4)
     view = LwdCloudBatchView(
         req_ids=["r1"],
         idx_mapping_np=np.array([3]),
@@ -215,6 +215,7 @@ def test_cloud_leader_broadcasts_staged_prompt_window(tmp_path: Path, monkeypatc
     monkeypatch.setattr("torch.cuda.Event", _Event)
     monkeypatch.setattr("torch.cuda.stream", stream_context)
     monkeypatch.setattr("torch.cuda.current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
     inputs_embeds = torch.zeros((2, 2), dtype=torch.bfloat16)
     next_prompt_embeds = torch.zeros((4, 2), dtype=torch.bfloat16)
 

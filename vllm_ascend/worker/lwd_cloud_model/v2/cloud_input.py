@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig
+from vllm.config.lwd import LwdConnectionId
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.worker.gpu.lwd.cloud_input import (
     LwdCloudBatchView,
@@ -65,36 +66,68 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
             self._lwd_hash_placeholder_ids = torch.zeros_like(self._lwd_hash_token_ids)
             self._lwd_hash_step_tokens: int | None = None
 
+    def _up_source_rank(self, connection: LwdConnectionId, ranks: list[int]) -> int:
+        if self._up_src_ranks is None:
+            return ranks[0]
+        return self._up_src_ranks[connection]
+
     def _harvest_window(
         self,
         plan: list[LwdPromptWindow],
         next_prompt_embeds: torch.Tensor,
         view: LwdCloudBatchView,
+        connection: LwdConnectionId,
     ) -> LwdStagedWindow:
-        if self.prompt_stage is not None:
-            device_payload, window_index, _ = super()._harvest_window(plan, next_prompt_embeds, view)
+        import torch.distributed as dist
+
+        tp = get_tp_group()
+        source_rank = self._up_source_rank(connection, tp.ranks)
+        if source_rank == self._local_rank:
+            device_payload, window_index, _ = super()._harvest_window(
+                plan,
+                next_prompt_embeds,
+                view,
+                connection,
+            )
         else:
             numel = sum(window.rows for window in plan) * self._elements_per_row()
             device_payload = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
             window_index = None
-        import torch.distributed as dist
-
-        tp = get_tp_group()
         if tp.world_size > 1:
             dist.broadcast(
                 device_payload,
-                src=tp.ranks[0],
+                src=source_rank,
                 group=tp.device_group,
                 async_op=True,
             ).wait()
-            if self.enable_lookahead:
-                dist.broadcast(
-                    next_prompt_embeds,
-                    src=tp.ranks[0],
-                    group=tp.device_group,
-                    async_op=True,
-                ).wait()
         return LwdStagedWindow(device_payload, window_index, plan)
+
+    def _broadcast_lookahead(
+        self,
+        plan: list[LwdPromptWindow],
+        next_prompt_embeds: torch.Tensor,
+        view: LwdCloudBatchView,
+        connection: LwdConnectionId,
+    ) -> None:
+        if not self.enable_lookahead:
+            return
+        indices = self._lookahead_indices(plan, view)
+        if not indices:
+            return
+        tp = get_tp_group()
+        if tp.world_size == 1:
+            return
+        import torch.distributed as dist
+
+        index_tensor = torch.tensor(indices, dtype=torch.int64, device=self.device)
+        lookahead = next_prompt_embeds.index_select(0, index_tensor)
+        dist.broadcast(
+            lookahead,
+            src=self._up_source_rank(connection, tp.ranks),
+            group=tp.device_group,
+            async_op=True,
+        ).wait()
+        next_prompt_embeds.index_copy_(0, index_tensor, lookahead)
 
     def _elements_per_row(self) -> int:
         return self.hidden_size + 4 * self.num_hash_layers * self.num_experts_per_tok
