@@ -697,7 +697,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     hidden.shape[0],
                 )
             if is_driver and output is not None:
-                target = getattr(output, "_model_runner_output", output)
+                target = output.get_model_runner_output() if isinstance(output, AsyncModelRunnerOutput) else output
                 target.lwd_down_carriers = carriers
                 # The events belong to this output generation and must be
                 # consumed before the output crosses the process boundary.
