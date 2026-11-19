@@ -59,8 +59,8 @@ def lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
 class LwdTransferQueue:
     """One FIFO of pending requests for one DP connection, channel and op."""
 
-    def __init__(self, dp_idx: int | ConnectionId, channel_type: LwdChannelType, op: str) -> None:
-        self.connection = dp_idx if isinstance(dp_idx, ConnectionId) else ConnectionId(dp_idx=dp_idx)
+    def __init__(self, connection: ConnectionId, channel_type: LwdChannelType, op: str) -> None:
+        self.connection = connection
         self.dp_idx = self.connection.dp_idx
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
@@ -374,9 +374,7 @@ class LwdTransferQueue:
     def _stream(self) -> Any:
         return lwd_channels.lwd_get_channel_stream(
             self.channel_type,
-            self.dp_idx,
-            edge_id=self.connection.edge_id,
-            cloud_id=self.connection.cloud_id,
+            self.connection,
         )
 
     def _copy_stream(self) -> torch.npu.Stream:
@@ -424,17 +422,13 @@ class LwdTransferQueue:
     def _post_send(self, req: LwdTransferRequest) -> list[Any]:
         group = lwd_channels.lwd_get_channel_device_group(
             self.channel_type,
-            self.dp_idx,
-            edge_id=self.connection.edge_id,
-            cloud_id=self.connection.cloud_id,
+            self.connection,
         )
         peer = req.peer_rank
         if peer is None:
             peer = lwd_channels.lwd_get_channel_peer(
                 self.channel_type,
-                self.dp_idx,
-                edge_id=self.connection.edge_id,
-                cloud_id=self.connection.cloud_id,
+                self.connection,
             )
         tensor = req.tensor
         assert tensor is not None
@@ -468,17 +462,13 @@ class LwdTransferQueue:
     def _post_recv(self, req: LwdTransferRequest) -> tuple[torch.Tensor, torch.Tensor | None, list[Any]]:
         group = lwd_channels.lwd_get_channel_device_group(
             self.channel_type,
-            self.dp_idx,
-            edge_id=self.connection.edge_id,
-            cloud_id=self.connection.cloud_id,
+            self.connection,
         )
         peer = req.peer_rank
         if peer is None:
             peer = lwd_channels.lwd_get_channel_peer(
                 self.channel_type,
-                self.dp_idx,
-                edge_id=self.connection.edge_id,
-                cloud_id=self.connection.cloud_id,
+                self.connection,
             )
         logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",

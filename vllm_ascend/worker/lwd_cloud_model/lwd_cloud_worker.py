@@ -92,7 +92,9 @@ class LwdCloudWorker(LwdWorkerBase):
             if connection.connection_id.dp_idx == self._lwd_dp_idx
         )
         if not self._lwd_connections:
-            self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
+            raise RuntimeError(
+                f"[Lwd][cloud-worker] no topology connection for cloud={lwd_config.instance.id} dp={self._lwd_dp_idx}"
+            )
         global_rank = dist.get_rank()
         if lwd_config.topology.is_host_comm:
             # Host links terminate at TP rank 0 of this instance world.
