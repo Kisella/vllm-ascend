@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.lwd_control.lwd_model.deepseek_v41.lwd_engram_hasher import LwdEngramHasher
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
@@ -59,10 +60,13 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
+        # The cloud owns Engram tables; the edge only needs their hash layout.
+        self.engram_hasher = LwdEngramHasher.from_model_config(self.model_config)
         self.up_payload_layout = LwdUpPayloadLayout(self.model_config.get_hidden_size())
+        self._lwd_engram_prompts: dict[str, torch.Tensor] = {}
 
     def _load_lwd_edge_hash_tables(self) -> None:
-        """Load the DeepSeek V4 CPU Hash routing tables from the checkpoint."""
+        """Load edge lookup tables and fix the UP payload layout."""
         # [layer-trace] Parity instrumentation (env-gated, zero overhead
         # when off): the edge install point; cloud and centralized share
         # the same code (see lwd_debug.lwd_layer_trace).
@@ -71,6 +75,23 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         )
 
         install_lwd_layer_trace(self.get_model())
+        self._lwd_load_tid2eid_tables()
+        self.up_payload_layout = self._lwd_build_up_payload_layout()
+        lwd_logger.info("[lwd-edge] UP payload layout %s", self.up_payload_layout)
+
+    def _lwd_build_up_payload_layout(self) -> LwdUpPayloadLayout:
+        """Build the same UP segments the cloud derives from its config."""
+        hasher = self.engram_hasher
+        return LwdUpPayloadLayout(
+            hidden_size=self.model_config.get_hidden_size(),
+            num_hash_layers=len(self.tid2eid_tables),
+            hash_top_k=self.tid2eid_tables[0].shape[1] if self.tid2eid_tables else 0,
+            num_engram_layers=hasher.num_layers if hasher is not None else 0,
+            num_engram_cols=hasher.num_hash_cols if hasher is not None else 0,
+        )
+
+    def _lwd_load_tid2eid_tables(self) -> None:
+        """Read the CPU Hash routing tables of DeepSeek V4 from the weight files."""
         config = self.model_config.hf_config
         if getattr(config, "model_type", None) != "deepseek_v4":
             return
@@ -96,11 +117,6 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
             config.vocab_size,
             config.num_experts_per_tok,
             config.n_routed_experts,
-        )
-        self.up_payload_layout = LwdUpPayloadLayout(
-            hidden_size=self.model_config.get_hidden_size(),
-            num_hash_layers=len(self.tid2eid_tables),
-            hash_top_k=self.tid2eid_tables[0].shape[1] if self.tid2eid_tables else 0,
         )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -196,6 +212,7 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         if not batch_meta.token_ids:
             return self._lwd_watermarked_output(connection)
 
+        self._lwd_register_engram_prompts(scheduler_output)
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
         lwd_logger.debug("[Lwd][edge-worker] embed token_ids=%s", flat_token_ids)
@@ -215,18 +232,7 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         else:
             embeds = model.embed_input_ids(token_ids_tensor)  # (total_N, H)
         _t_fwd = time.monotonic()
-        payload = embeds
-        if self.tid2eid_tables:
-            # The original prompt IDs stay on the edge; transmit only lookups.
-            cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
-            expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
-            payload = self.up_payload_layout.pack(embeds, expert_ids)
-            lwd_logger.info(
-                "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
-                seqno,
-                tuple(expert_ids.shape),
-                payload.numel(),
-            )
+        payload = self._lwd_build_up_payload(seqno, embeds, flat_token_ids, batch_meta)
 
         # mrope positions ride the control plane with the RangeNotify
         # (wire_version>=2); the data plane sends only the main embeds
@@ -257,6 +263,66 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
             len(flat_token_ids),
         )
         return self._lwd_watermarked_output(connection)
+
+    def _lwd_build_up_payload(
+        self,
+        seqno: int,
+        embeds: torch.Tensor,
+        flat_token_ids: list[int],
+        batch_meta: LwdEmbedBatch,
+    ) -> torch.Tensor:
+        """Append id-derived segments without sending the original prompt ids."""
+        layout = self.up_payload_layout
+        expert_ids = None
+        if self.tid2eid_tables:
+            cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
+            expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
+        engram_hashes = self._lwd_engram_hashes(batch_meta) if self.engram_hasher is not None else None
+        payload = layout.pack(embeds, expert_ids, engram_hashes)
+        if expert_ids is not None or engram_hashes is not None:
+            lwd_logger.info(
+                "[lwd-edge] UP id-derived segments seqno=%d experts=%s engram=%s payload_numel=%d",
+                seqno,
+                None if expert_ids is None else tuple(expert_ids.shape),
+                None if engram_hashes is None else tuple(engram_hashes.shape),
+                payload.numel(),
+            )
+        return payload
+
+    def _lwd_register_engram_prompts(self, scheduler_output: SchedulerOutput) -> None:
+        """Retain full prompts for cross-chunk Engram look-back until completion."""
+        if self.engram_hasher is None:
+            return
+        for req_data in scheduler_output.scheduled_new_reqs:
+            req_id = req_data.req_id
+            if req_data.prompt_token_ids is None:
+                if req_id in self._lwd_engram_prompts:
+                    continue
+                raise ValueError(f"[LWD] Engram hashing needs prompt token ids, request {req_id} has none")
+            self._lwd_engram_prompts[req_id] = torch.tensor(req_data.prompt_token_ids, dtype=torch.int64)
+
+    def _lwd_engram_hashes(self, batch_meta: LwdEmbedBatch) -> torch.Tensor:
+        """Compute Engram bucket indices in the same row order as the embeddings."""
+        assert self.engram_hasher is not None
+        if len(batch_meta.prompt_offsets) != len(batch_meta.req_ids):
+            raise ValueError(
+                f"[LWD] Engram hashing needs one prompt offset per request, got "
+                f"{len(batch_meta.prompt_offsets)} offsets for {len(batch_meta.req_ids)} requests"
+            )
+        chunks: list[torch.Tensor] = []
+        for req_id, token_ids, start in zip(batch_meta.req_ids, batch_meta.token_ids, batch_meta.prompt_offsets):
+            prompt = self._lwd_engram_prompts.get(req_id)
+            if prompt is None:
+                raise ValueError(f"[LWD] no registered prompt for Engram hashing of request {req_id}")
+            end = start + len(token_ids)
+            chunks.append(self.engram_hasher.prompt_hashes(prompt, start, end))
+        return torch.cat(chunks)
+
+    def lwd_release_finished(self, finished_req_ids: set[str]) -> None:
+        """Drop per-request MM and Engram state, including aborted prefills."""
+        self.mm_cache.release_finished(list(finished_req_ids))
+        for req_id in finished_req_ids:
+            self._lwd_engram_prompts.pop(req_id, None)
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
