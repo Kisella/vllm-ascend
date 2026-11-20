@@ -32,6 +32,7 @@ Block sizing comes from the topology (``deployment.data_plane_host``):
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -48,6 +49,7 @@ from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
     LwdNpuUcxChannelIoConfig,
 )
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count
 
 # (edge_id, cloud_id, dp_idx, channel, op) -> LwdNpuUcxChannelIo
 _UCX_IOS: dict[tuple[int, int, int, LwdChannelType, str], LwdNpuUcxChannelIo] = {}
@@ -161,16 +163,24 @@ def _resolve_up_block_mb() -> int:
         raise RuntimeError(
             "[LWD] host UP block auto-sizing failed: scheduler_config.max_num_batched_tokens is unavailable"
         )
+    # Hash tables are indexable by layer ID only for a contiguous prefix, so the
+    # shared resolver owns both validation and the old/new V4 layout choice.
+    hash_config = SimpleNamespace(
+        model_type=attr("model_type"),
+        num_hidden_layers=attr("num_hidden_layers"),
+        mlp_layer_types=attr("mlp_layer_types"),
+        num_hash_layers=attr("num_hash_layers"),
+    )
     try:
         plan = ucx_block_policy.resolve(
             model_type=attr("model_type") or "",
             hidden_size=attr("hidden_size"),
-            num_hash_layers=attr("num_hash_layers") or 0,
+            num_hash_layers=hash_layer_count(hash_config),
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=max_num_batched_tokens,
             explicit_up_block_mb=_host_plane().up_buffer_size,
         )
-    except ucx_block_policy.LwdUcxBlockPolicyError as exc:
+    except (ucx_block_policy.LwdUcxBlockPolicyError, ValueError) as exc:
         raise RuntimeError(f"[LWD] host UP block auto-sizing failed: {exc}") from exc
     # Keep this record format stable: the log-analysis tooling parses it.
     for warning in plan.warnings:

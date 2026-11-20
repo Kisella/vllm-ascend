@@ -49,6 +49,35 @@ def load_methods(path, names, base=object, extra_classes=(), **globals_):
 RUNNER = "worker/lwd_cloud_model/lwd_cloud_model_runner.py"
 
 
+class TestHashLayerConfig(unittest.TestCase):
+    def test_new_config_without_legacy_attribute(self) -> None:
+        config = NS(
+            model_type="deepseek_v4", num_hidden_layers=4, mlp_layer_types=["hash_moe", "hash_moe", "moe", "moe"]
+        )
+        self.assertEqual(routing.hash_layer_count(config), 2)
+
+    def test_new_layout_takes_precedence(self) -> None:
+        config = NS(model_type="deepseek_v4", num_hidden_layers=2, mlp_layer_types=["moe", "moe"], num_hash_layers=2)
+        self.assertEqual(routing.hash_layer_count(config), 0)
+
+    def test_legacy_and_non_v4(self) -> None:
+        config = NS(model_type="deepseek_v4", num_hidden_layers=4, num_hash_layers=2)
+        self.assertEqual(routing.hash_layer_count(config), 2)
+        self.assertEqual(routing.hash_layer_count(NS(model_type="qwen3_5")), 0)
+
+    def test_non_prefix_layout_is_rejected(self) -> None:
+        for kinds in (["moe", "hash_moe"], ["hash_moe", "moe", "hash_moe"]):
+            with self.subTest(kinds=kinds), self.assertRaisesRegex(ValueError, "contiguous prefix"):
+                routing.hash_layer_count(NS(model_type="deepseek_v4", num_hidden_layers=3, mlp_layer_types=kinds))
+
+    def test_missing_or_invalid_counts_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires"):
+            routing.hash_layer_count(NS(model_type="deepseek_v4", num_hidden_layers=4))
+        for count in (-1, 5, True, "2"):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "Invalid"):
+                routing.hash_layer_count(NS(model_type="deepseek_v4", num_hidden_layers=4, num_hash_layers=count))
+
+
 class TestHashTransport(unittest.TestCase):
     def test_lossless_ids_above_bf16_integer_precision(self):
         embeds = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
@@ -442,7 +471,7 @@ class TestMixedInjection(unittest.TestCase):
         self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
         self.runner.model_config = NS(
             get_hidden_size=lambda: 2,
-            hf_config=NS(model_type="deepseek_v4", num_hash_layers=1, num_experts_per_tok=2),
+            hf_config=NS(model_type="deepseek_v4", num_hidden_layers=2, num_hash_layers=1, num_experts_per_tok=2),
         )
         self.runner.input_batch = NS(
             num_reqs=3,
