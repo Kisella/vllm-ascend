@@ -105,7 +105,7 @@ def test_multi_chunk_arrival_and_read_coordinates() -> None:
     assert stager.publish_received(stage_key(1)) == [("r0", 2, 0)]
     assert stager.busy_slots() == []
     assert stager.recv_rows("r0") == 2
-    assert stager.segment_for("r0", 2) == (0, 8, -1)
+    assert stager.segment_for("r0", 2) == (0, 8, ())
     stager.consume("r0", 2)
 
     stager.allocate(stage_key(2), 3 * HIDDEN)
@@ -115,7 +115,7 @@ def test_multi_chunk_arrival_and_read_coordinates() -> None:
     assert stager.publish_received(stage_key(2)) == [("r0", 3, 2)]
     assert stager.recv_rows("r0") == 5
     assert stager.consumed_rows("r0") == 2
-    assert stager.segment_for("r0", 3) == (8, 12, -1)
+    assert stager.segment_for("r0", 3) == (8, 12, ())
     assert slot == 0
 
 
@@ -146,7 +146,7 @@ def test_nonzero_first_chunk_seeds_prefix_watermarks() -> None:
 
     assert stager.publish_received(stage_key(1)) == [("r0", 2, 2)]
     assert stager.recv_rows("r0") == 4
-    assert stager.segment_for("r0", 2) == (8, 8, -1)
+    assert stager.segment_for("r0", 2) == (8, 8, ())
     with pytest.raises(LwdHostStageGeometryError, match="before drain"):
         plan_chunk(stager, 2, rows=2, offset=4, prompt_rows=6, prefix_nonce=1)
     assert stager.take_req("r0") is req
@@ -165,7 +165,7 @@ def test_refill_completion_hole_and_second_refill() -> None:
     assert stager.take_refill_done(CONNECTION) == []
     assert stager.stage_floor("r0") == 2
     assert stager.recv_rows("r0") == 10
-    assert stager.segment_for("r0", 2) == (8, 8, -1)
+    assert stager.segment_for("r0", 2) == (8, 8, ())
     stager.consume("r0", 2)
 
     assert stager.rewind_consumed("r0", 0)
@@ -179,7 +179,7 @@ def test_refill_completion_hole_and_second_refill() -> None:
     stager.publish_received(stage_key(4))
     assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
     assert stager.stage_floor("r0") == 0
-    assert stager.segment_for("r0", 2) == (0, 8, -1)
+    assert stager.segment_for("r0", 2) == (0, 8, ())
 
 
 def test_refill_done_preserves_prefix_nonce() -> None:
@@ -331,13 +331,13 @@ def test_rewind_consumed_preserves_arrival_and_rereads() -> None:
     assert req.consumed == 2
     assert req.recv_rows == 4
     assert req._written_hi == 4
-    assert stager.segment_for("r0", 2) == (8, 8, -1)
+    assert stager.segment_for("r0", 2) == (8, 8, ())
 
     assert stager.rewind_consumed("r0", 0)
     assert req.consumed == 0
     assert req.recv_rows == 4
     assert req._written_hi == 4
-    assert stager.segment_for("r0", 4) == (0, 16, -1)
+    assert stager.segment_for("r0", 4) == (0, 16, ())
     for invalid in (-1, 1):
         with pytest.raises(LwdHostStageGeometryError, match="rewind target"):
             stager.rewind_consumed("r0", invalid)
@@ -373,8 +373,7 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
         req_ids=["r0", "r1"],
         num_tokens_per_req=[2, 1],
         prompt_lens=[2, 3],
-        num_hash_layers=num_hash_layers,
-        num_experts_per_tok=num_experts_per_tok,
+        tail_sizes=(tail_per_row,),
     )
     assert [(view.start, source, size) for view, source, size in segments] == [
         (0, 0, 8),
@@ -384,16 +383,16 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
     ]
     batch = stager.batch(stage_key(1))
     assert batch.src_offsets == [0, 8]
-    assert batch.src_tail_offsets == [12, 60]
+    assert batch.src_tail_offsets == [(12,), (60,)]
     assert stager.take_req("r0").host.numel() == 56
     assert stager.take_req("r1").host.numel() == 84
     stager.publish_received(stage_key(1))
-    assert stager.segment_for("r0", 2) == (0, 8, 8)
-    assert stager.segment_for("r1", 1) == (0, 4, 12)
+    assert stager.segment_for("r0", 2) == (0, 8, (8,))
+    assert stager.segment_for("r1", 1) == (0, 4, (12,))
 
     stager.consume("r1", 1)
     assert stager.rewind_consumed("r1", 0)
-    assert stager.segment_for("r1", 1) == (0, 4, 12)
+    assert stager.segment_for("r1", 1) == (0, 4, (12,))
     stager.consume("r1", 1)
     continuation = stager.plan_recv_segments(
         seqno=stage_key(2),
@@ -403,15 +402,14 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
         num_tokens_per_req=[2],
         prompt_lens=[3],
         row_base=[1],
-        num_hash_layers=num_hash_layers,
-        num_experts_per_tok=num_experts_per_tok,
+        tail_sizes=(tail_per_row,),
     )
     assert [(view.start, source, size) for view, source, size in continuation] == [
         (4, 0, 8),
         (36, 8, 48),
     ]
     stager.publish_received(stage_key(2))
-    assert stager.segment_for("r1", 2) == (4, 8, 36)
+    assert stager.segment_for("r1", 2) == (4, 8, (36,))
 
 
 def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
@@ -424,8 +422,7 @@ def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
         "req_ids": ["r0"],
         "num_tokens_per_req": [2],
         "prompt_lens": [4],
-        "num_hash_layers": num_hash_layers,
-        "num_experts_per_tok": num_experts_per_tok,
+        "tail_sizes": (tail_per_row,),
     }
     stager.plan_recv_segments(
         seqno=stage_key(1),
@@ -446,7 +443,7 @@ def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
     stager.publish_received(stage_key(2))
     assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
     assert stager.rewind_consumed("r0", 0)
-    assert stager.segment_for("r0", 2) == (0, 8, 16)
+    assert stager.segment_for("r0", 2) == (0, 8, (16,))
 
 
 def test_read_consume_and_table_geometry_errors() -> None:
@@ -607,7 +604,7 @@ def test_mixed_batch_skips_old_generation_without_shifting_sources() -> None:
     assert [(view.start, source, size) for view, source, size in segments] == [(0, 8, 12)]
     assert stager.take_req("done") is None
     assert stager.batch(stage_key(1)).src_offsets == [0, 8]
-    assert stager.batch(stage_key(1)).src_tail_offsets == [-1, -1]
+    assert stager.batch(stage_key(1)).src_tail_offsets == [(), ()]
     assert stager.batch(stage_key(1)).total_rows == 5
     assert plan_chunk(stager, 2, rows=2, prompt_rows=2, req_id="done") == []
 

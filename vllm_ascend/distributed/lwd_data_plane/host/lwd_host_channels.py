@@ -180,12 +180,17 @@ def _resolve_up_block_mb() -> int:
         mlp_layer_types=attr("mlp_layer_types"),
         num_hash_layers=attr("num_hash_layers"),
     )
+    engram_layer_ids = attr("engram_layer_ids") or ()
+    num_engram_layers = len(engram_layer_ids)
+    num_engram_cols = (attr("engram_max_ngram_size") - 1) * attr("engram_n_heads") if num_engram_layers else 0
     try:
         plan = ucx_block_policy.resolve(
             model_type=attr("model_type") or "",
             hidden_size=attr("hidden_size"),
             num_hash_layers=hash_layer_count(hash_config),
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
+            num_engram_layers=num_engram_layers,
+            num_engram_cols=num_engram_cols,
             max_num_batched_tokens=max_num_batched_tokens,
             explicit_up_block_mb=_host_plane().up_buffer_size,
         )

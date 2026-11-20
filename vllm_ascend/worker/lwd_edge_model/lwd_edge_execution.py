@@ -26,8 +26,9 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
 from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
 from vllm_ascend.worker.lwd_base_model.lwd_staging_mixin import LwdStagingMixin
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, pack_hash_payload
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
+from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -58,6 +59,7 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
+        self.up_payload_layout = LwdUpPayloadLayout(self.model_config.get_hidden_size())
 
     def _load_lwd_edge_hash_tables(self) -> None:
         """Load the DeepSeek V4 CPU Hash routing tables from the checkpoint."""
@@ -94,6 +96,11 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
             config.vocab_size,
             config.num_experts_per_tok,
             config.n_routed_experts,
+        )
+        self.up_payload_layout = LwdUpPayloadLayout(
+            hidden_size=self.model_config.get_hidden_size(),
+            num_hash_layers=len(self.tid2eid_tables),
+            hash_top_k=self.tid2eid_tables[0].shape[1] if self.tid2eid_tables else 0,
         )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -213,7 +220,7 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
             # The original prompt IDs stay on the edge; transmit only lookups.
             cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
             expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
-            payload = pack_hash_payload(embeds, expert_ids)
+            payload = self.up_payload_layout.pack(embeds, expert_ids)
             lwd_logger.info(
                 "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
                 seqno,

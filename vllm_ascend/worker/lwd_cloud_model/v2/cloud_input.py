@@ -176,7 +176,7 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         for window in plan:
             request = self.prompt_stage.take_req(window.req_id)
             assert request is not None
-            tail_start, _ = request.tail_range_at(window.start, window.rows)
+            tail_start, _ = request.tail_range_at(0, window.start, window.rows)
             numel = window.rows * tail_per_row
             device_payload[tail_offset : tail_offset + numel].copy_(
                 request.host[tail_start : tail_start + numel], non_blocking=True
