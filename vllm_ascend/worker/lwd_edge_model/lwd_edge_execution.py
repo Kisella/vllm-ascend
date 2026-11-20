@@ -73,8 +73,6 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         if getattr(config, "model_type", None) != "deepseek_v4":
             return
         num_hash_layers = hash_layer_count(config)
-        if not 0 <= num_hash_layers <= config.num_hidden_layers:
-            raise ValueError(f"Invalid DeepSeek V4 num_hash_layers: {num_hash_layers}")
         if num_hash_layers == 0:
             lwd_logger.info("[lwd-edge] tid2eid loading skipped: num_hash_layers=0")
             return
