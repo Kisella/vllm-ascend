@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -16,9 +17,11 @@ from vllm_ascend.distributed.lwd_data_plane import lwd_transfer_queue as queue_m
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransferQueue
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+    ConnectionId,
     LwdChannelType,
     LwdTransferRequest,
     LwdTransferStatus,
+    connection_from,
 )
 
 
@@ -92,9 +95,9 @@ def npu_runtime(monkeypatch: pytest.MonkeyPatch) -> _NpuRuntime:
     monkeypatch.setattr(queue_module.torch.npu, "stream", runtime.activate_stream)
     monkeypatch.setattr(queue_module.torch.npu, "current_stream", lambda: runtime.current_stream)
     monkeypatch.setattr(queue_module, "lwd_scramble_seed_for", lambda request: None)
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_stream", lambda channel, dp_idx: runtime.channel_stream)
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_device_group", lambda channel, dp_idx: object())
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_peer", lambda channel, dp_idx: 1)
+    monkeypatch.setattr(lwd_channels, "lwd_get_channel_stream", lambda channel, connection: runtime.channel_stream)
+    monkeypatch.setattr(lwd_channels, "lwd_get_channel_device_group", lambda channel, connection: object())
+    monkeypatch.setattr(lwd_channels, "lwd_get_channel_peer", lambda channel, connection: 1)
     monkeypatch.setattr(queue_module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(queue_module.dist, "get_process_group_ranks", lambda group: [0, 1])
     monkeypatch.setattr(queue_module.dist, "irecv", runtime.receive)
@@ -112,7 +115,16 @@ def _request(num_elements: int = 6, **overrides: Any) -> LwdTransferRequest:
 
 
 def _queue() -> LwdTransferQueue:
-    return LwdTransferQueue(dp_idx=0, channel_type=LwdChannelType.DOWN, op="recv")
+    return LwdTransferQueue(
+        connection=ConnectionId(0, 0, 0),
+        channel_type=LwdChannelType.DOWN,
+        op="recv",
+    )
+
+
+def test_connection_from_rejects_legacy_metadata() -> None:
+    with pytest.raises(ValueError, match="canonical connection_id"):
+        connection_from(SimpleNamespace(dp_idx=0))
 
 
 def _destination(runtime: _NpuRuntime, numel: int) -> MagicMock:
