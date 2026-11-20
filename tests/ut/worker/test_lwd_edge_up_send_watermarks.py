@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Tests for per-connection contiguous UP send-completion watermarks."""
+"""Tests for per-DP contiguous UP send-completion watermarks."""
 
 from __future__ import annotations
 
@@ -24,7 +24,9 @@ from vllm.v1.core.sched.output import (  # noqa: E402
 from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import (  # noqa: E402
     LwdTransferFuture,
 )
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId  # noqa: E402
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import (  # noqa: E402
+    ConnectionId,
+)
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E402
     LwdEdgeModelRunner,
 )
@@ -32,8 +34,8 @@ from vllm_ascend.worker.lwd_edge_model.lwd_edge_worker import (  # noqa: E402
     LwdEdgeWorker,
 )
 
-_DP0 = ConnectionId(0, 0, 0)
-_DP1 = ConnectionId(0, 0, 1)
+DP0 = ConnectionId(0, 0, 0)
+DP1 = ConnectionId(0, 0, 1)
 
 
 class _FakeFuture:
@@ -73,51 +75,51 @@ def test_watermark_advances_across_completed_prefix() -> None:
     runner = _make_runner()
     futures = [_FakeFuture(completed=True), _FakeFuture(completed=True), _FakeFuture()]
     for seqno, future in enumerate(futures):
-        _add_send(runner, _DP0, seqno, future)
+        _add_send(runner, DP0, seqno, future)
 
-    assert runner._lwd_watermarked_output(_DP0).lwd_up_send_watermarks == {_DP0: 1}
+    assert runner._lwd_watermarked_output(DP0).lwd_up_send_watermarks == {DP0: 1}
 
     futures[2].complete()
-    assert runner._lwd_watermarked_output(_DP0).lwd_up_send_watermarks == {_DP0: 2}
+    assert runner._lwd_watermarked_output(DP0).lwd_up_send_watermarks == {DP0: 2}
 
 
 def test_out_of_order_completion_cannot_advance_watermark() -> None:
     runner = _make_runner()
     futures = [_FakeFuture(), _FakeFuture(completed=True), _FakeFuture(completed=True)]
     for seqno, future in enumerate(futures):
-        _add_send(runner, _DP0, seqno, future)
+        _add_send(runner, DP0, seqno, future)
 
-    assert runner._lwd_watermarked_output(_DP0).lwd_up_send_watermarks == {_DP0: -1}
+    assert runner._lwd_watermarked_output(DP0).lwd_up_send_watermarks == {DP0: -1}
 
     futures[0].complete()
-    assert runner._lwd_watermarked_output(_DP0).lwd_up_send_watermarks == {_DP0: 2}
+    assert runner._lwd_watermarked_output(DP0).lwd_up_send_watermarks == {DP0: 2}
 
 
-def test_same_seqno_is_isolated_and_embed_returns_current_connection() -> None:
+def test_same_seqno_is_isolated_and_embed_returns_current_dp() -> None:
     runner = _make_runner()
     dp0_future = _FakeFuture(completed=True)
     dp1_future = _FakeFuture()
-    _add_send(runner, _DP0, 0, dp0_future)
-    _add_send(runner, _DP1, 0, dp1_future)
+    _add_send(runner, DP0, 0, dp0_future)
+    _add_send(runner, DP1, 0, dp1_future)
     scheduler_output = cast(SchedulerOutput, SimpleNamespace(scheduled_new_reqs=[]))
 
     with patch.object(runner, "get_model", return_value=None):
-        dp0_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=_DP0), scheduler_output)
-        dp1_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=_DP1), scheduler_output)
+        dp0_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=DP0), scheduler_output)
+        dp1_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=DP1), scheduler_output)
 
-    assert dp0_output.lwd_up_send_watermarks == {_DP0: 0}
-    assert dp1_output.lwd_up_send_watermarks == {_DP1: -1}
+    assert dp0_output.lwd_up_send_watermarks == {DP0: 0}
+    assert dp1_output.lwd_up_send_watermarks == {DP1: -1}
 
 
-def test_empty_unembed_returns_all_connection_watermarks() -> None:
+def test_empty_unembed_returns_all_dp_watermarks() -> None:
     runner = _make_runner()
-    _add_send(runner, _DP0, 0, _FakeFuture(completed=True))
-    _add_send(runner, _DP1, 0, _FakeFuture())
+    _add_send(runner, DP0, 0, _FakeFuture(completed=True))
+    _add_send(runner, DP1, 0, _FakeFuture())
 
     with patch.object(runner, "get_model", return_value=None):
-        output = runner.execute_lwd_unembed(0, LwdUnembedBatch(connection_id=_DP1))
+        output = runner.execute_lwd_unembed(0, LwdUnembedBatch(connection_id=DP1))
 
-    assert output.lwd_up_send_watermarks == {_DP0: 0, _DP1: -1}
+    assert output.lwd_up_send_watermarks == {DP0: 0, DP1: -1}
 
 
 @pytest.mark.parametrize(
@@ -125,10 +127,10 @@ def test_empty_unembed_returns_all_connection_watermarks() -> None:
     [None, SimpleNamespace(batch_type=object(), batch_meta=None)],
     ids=["empty-batch", "unknown-batch"],
 )
-def test_worker_step_without_compute_returns_all_connection_watermarks(lwd_batch: object | None) -> None:
+def test_worker_step_without_compute_returns_all_dp_watermarks(lwd_batch: object | None) -> None:
     runner = _make_runner()
-    _add_send(runner, _DP0, 0, _FakeFuture(completed=True))
-    _add_send(runner, _DP1, 0, _FakeFuture())
+    _add_send(runner, DP0, 0, _FakeFuture(completed=True))
+    _add_send(runner, DP1, 0, _FakeFuture())
     worker = LwdEdgeWorker.__new__(LwdEdgeWorker)
     worker.model_runner = runner
     worker.comm_service = SimpleNamespace(poll_completions=Mock())
@@ -139,17 +141,17 @@ def test_worker_step_without_compute_returns_all_connection_watermarks(lwd_batch
 
     output = worker.execute_model(scheduler_output)
 
-    assert output.lwd_up_send_watermarks == {_DP0: 0, _DP1: -1}
+    assert output.lwd_up_send_watermarks == {DP0: 0, DP1: -1}
     worker.comm_service.poll_completions.assert_called_once_with()
 
 
 def test_send_error_does_not_pop_or_advance_watermark() -> None:
     runner = _make_runner()
     future = _FakeFuture(completed=True, error=RuntimeError("send failed"))
-    _add_send(runner, _DP0, 0, future)
+    _add_send(runner, DP0, 0, future)
 
     with pytest.raises(RuntimeError, match="send failed"):
-        runner._lwd_watermarked_output(_DP0)
+        runner._lwd_watermarked_output(DP0)
 
     assert runner._lwd_up_send_watermarks == {}
-    assert [seqno for seqno, _ in runner._lwd_up_send_inflight[_DP0]] == [0]
+    assert [seqno for seqno, _ in runner._lwd_up_send_inflight[DP0]] == [0]

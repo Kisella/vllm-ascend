@@ -108,8 +108,9 @@ def test_select_doctests_by_marker_group(helper, monkeypatch, group_name, expect
     monkeypatch.setattr(
         helper,
         "read_repo_text",
-        lambda path,
-        ref: f"extra:\n  release_vllm_ascend_version: {'new' if release_changed and ref == 'head' else 'old'}\n",
+        lambda path, ref: (
+            f"extra:\n  release_vllm_ascend_version: {'new' if release_changed and ref == 'head' else 'old'}\n"
+        ),
     )
     if release_changed:
         expected = {
@@ -139,13 +140,13 @@ def test_select_doctests_by_marker_group(helper, monkeypatch, group_name, expect
             False,
             {"quickstart": ["a2", "310p"], "installation": ["pip"]},
         ),
-        (set(), True, {"quickstart": ["a2", "310p"], "installation": ["source"]}),
+        (set(), True, {"quickstart": ["a2", "310p"], "installation": ["pip"]}),
         (
             {"tests/e2e/doctests/scripts/doctest_helper.py"},
             True,
             {"quickstart": ["a2", "310p"], "installation": ["source", "pip"]},
         ),
-        ({"README.md"}, False, {"quickstart": [], "installation": []}),
+        ({"README_vllm-ascend.md"}, False, {"quickstart": [], "installation": []}),
     ],
 )
 def test_select_doctests_by_path_or_release(helper, monkeypatch, paths, release_changed, expected):
