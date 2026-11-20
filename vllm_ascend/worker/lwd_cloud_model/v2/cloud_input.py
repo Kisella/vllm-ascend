@@ -171,8 +171,9 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         next_prompt_embeds: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> None:
-        self._prepare_hash_batch(view, input_ids)
         super().stage_prompt_window(view, inputs_embeds, next_prompt_embeds, input_ids)
+        # Populate request expert IDs from the received windows before reading them.
+        self._prepare_hash_batch(view, input_ids)
 
     def _prepare_hash_batch(self, view: LwdCloudBatchView, input_ids: torch.Tensor | None) -> None:
         if self.lwd_hash_state is None:
