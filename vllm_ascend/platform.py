@@ -1841,7 +1841,13 @@ def _get_dyntra_lb_scheduler_cls(*, async_scheduling: bool) -> str:
 
 
 def _validate_engram_config(vllm_config: VllmConfig) -> None:
+    lwd_config = getattr(vllm_config, "lwd_config", None)
     engram_config = getattr(vllm_config, "engram_config", None)
+    if lwd_config is not None and lwd_config.role == "edge":
+        if engram_config is not None:
+            raise ValueError("LWD edge does not accept an Engram config; only the cloud owns tables")
+        # Layer ids remain hash metadata on the edge; only the cloud owns tables.
+        return
     model_config = vllm_config.model_config
     spec = vllm_config.speculative_config
     if spec is not None and model_config is spec.draft_model_config:
