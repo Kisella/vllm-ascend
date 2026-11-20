@@ -27,11 +27,17 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
-from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
+from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
+    LwdMTPProposer,
+    LwdMultiKVCacheGroupMTPProposer,
+)
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
+)
+from vllm_ascend.worker.v1.spec_decode.multi_kv_cache_group_proposer import (
+    is_multi_kv_cache_group_mtp,
 )
 
 if TYPE_CHECKING:
@@ -236,7 +242,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             and self.speculative_config.method == "mtp"
             and not self.speculative_config.use_step3p5_mtp()
         ):
-            return LwdMTPProposer(self.vllm_config, self.device, self)
+            proposer_cls = (
+                LwdMultiKVCacheGroupMTPProposer if is_multi_kv_cache_group_mtp(self.vllm_config) else LwdMTPProposer
+            )
+            return proposer_cls(self.vllm_config, self.device, self)
         return super()._get_drafter()
 
     # ------------------------------------------------------------------ #

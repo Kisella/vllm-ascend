@@ -29,6 +29,8 @@ class LwdAscendCloudModelRunnerV2(LwdCloudModelRunnerMixin, NPUModelRunner):
     def create_speculator(self) -> Any:
         assert self.speculative_config is not None
         if self.speculative_config.method == "mtp":
+            # Native MRV2 attention initialization already handles per-KV-cache-group
+            # metadata; the LWD mixin only replaces the prompt-embedding path.
             return LwdAscendCloudMTPSpeculator(self.vllm_config, self.device)
         return super().create_speculator()
 

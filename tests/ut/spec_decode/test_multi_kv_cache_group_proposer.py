@@ -25,6 +25,45 @@ def test_multi_group_proposer_directly_inherits_ascend_eagle():
     )
 
 
+def test_lwd_composite_proposer_keeps_both_parent_axes():
+    from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
+        LwdMTPProposer,
+        LwdMultiKVCacheGroupMTPProposer,
+    )
+
+    assert LwdMultiKVCacheGroupMTPProposer.__bases__ == (
+        LwdMTPProposer,
+        AscendMultiKVCacheGroupMTPProposer,
+    )
+    assert LwdMultiKVCacheGroupMTPProposer._lwd_build_first_pass_embeds is LwdMTPProposer._lwd_build_first_pass_embeds
+    assert (
+        LwdMultiKVCacheGroupMTPProposer.initialize_attn_backend
+        is AscendMultiKVCacheGroupMTPProposer.initialize_attn_backend
+    )
+    assert (
+        LwdMultiKVCacheGroupMTPProposer.build_draft_attn_metadata
+        is AscendMultiKVCacheGroupMTPProposer.build_draft_attn_metadata
+    )
+
+
+def test_mrv2_lwd_speculator_retains_native_multi_group_attention_path():
+    from vllm.v1.worker.gpu.lwd.mtp_speculator import LwdCloudMTPSpeculatorMixin
+
+    from vllm_ascend.worker.lwd_cloud_model.v2.mtp_speculator import (
+        LwdAscendCloudMTPSpeculator,
+    )
+    from vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator import (
+        AscendTargetDependentARSpeculator,
+    )
+
+    assert issubclass(LwdAscendCloudMTPSpeculator, LwdCloudMTPSpeculatorMixin)
+    assert LwdAscendCloudMTPSpeculator.set_attn is AscendTargetDependentARSpeculator.set_attn
+    assert (
+        LwdAscendCloudMTPSpeculator._prepare_draft_model_inputs
+        is LwdCloudMTPSpeculatorMixin._prepare_draft_model_inputs
+    )
+
+
 def test_draft_step_update_matches_parent_signature():
     assert inspect.signature(AscendMultiKVCacheGroupMTPProposer.attn_update_stack_num_spec_norm) == inspect.signature(
         AscendEagleProposer.attn_update_stack_num_spec_norm
