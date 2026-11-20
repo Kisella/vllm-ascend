@@ -134,7 +134,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
     # LWD: provider of edge-computed prompt embeddings for the
-    # draft model's first pass (set by the worker at bring-up on the cloud).
+    # MTP draft model's first pass (set by the worker at bring-up on the cloud).
     # provider(req_id) -> Tensor [N, H] | None.
     _lwd_prompt_embeds_provider = None
 
@@ -1850,12 +1850,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         prompt segments to placeholder zeros, corrupting draft state at
         the root (a known defect under MTP mixed batching).
 
-        Returns None (caller falls back to the token-id path) when no
-        provider is configured, a request that needs prompt embeds lacks
-        received rows / the chunk's rows are not yet fully assembled, the
-        draft model does not consume ``inputs_embeds``, or a CP (pcp)
-        manager rewrites first-pass inputs (different layout).
+        Returns None (caller falls back to the token-id path) when the
+        method is not MTP, no provider is configured, a request that needs
+        prompt embeds lacks received rows / the chunk's rows are not yet
+        fully assembled, the draft model does not consume ``inputs_embeds``,
+        or a CP (pcp) manager rewrites first-pass inputs (different layout).
         """
+        # Parallel drafters build an anchor + noise first pass, not MTP's
+        # shifted-prompt layout, and never consume prompt embeddings.
+        if self.method != "mtp":
+            return None
         runner = self.runner
         if runner is None:
             return None
