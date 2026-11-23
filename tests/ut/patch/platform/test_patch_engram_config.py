@@ -124,3 +124,11 @@ def test_platform_leaves_non_engram_models_alone(engram_config):
     engram_config.model_config.architecture = "OtherModel"
     _validate_engram_config(engram_config)
     assert engram_config.engram_config is None
+
+
+def test_lwd_edge_discards_engram_config(engram_config):
+    from vllm_ascend.platform import _validate_engram_config
+
+    engram_config.lwd_config = SimpleNamespace(role="edge")
+    _validate_engram_config(engram_config)
+    assert engram_config.engram_config is None

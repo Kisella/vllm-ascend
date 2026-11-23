@@ -57,6 +57,19 @@ def test_dsv4_20480_uses_192mib():
     assert plan.auto_up_block_mb == 192
 
 
+def test_dsv41_engram_tail_is_included():
+    plan = resolve(
+        model_type="deepseek_v41",
+        hidden_size=4096,
+        num_engram_layers=2,
+        num_engram_cols=12,
+        max_num_batched_tokens=20_480,
+    )
+    assert plan.per_token_elements == 4192
+    assert plan.up_block_mb == 192
+    assert plan.auto_up_block_mb == 192
+
+
 def test_qwen_7168_uses_288mib_without_hash_tail():
     plan = resolve(
         model_type="qwen3",

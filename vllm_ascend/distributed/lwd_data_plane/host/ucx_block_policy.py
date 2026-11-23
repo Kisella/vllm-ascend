@@ -14,6 +14,7 @@ MIN_UP_BLOCK_MB = 128
 BLOCK_ALIGN_MB = 32
 BF16_BYTES = 2
 DSV4_MODEL_TYPE = "deepseek_v4"
+DSV41_MODEL_TYPE = "deepseek_v41"
 
 AUTO_SOURCE = "auto"
 EXPLICIT_SOURCE = "explicit"
@@ -39,7 +40,7 @@ class LwdUcxBlockPlan:
 
 
 def _is_known_model(model_type: str) -> bool:
-    return model_type == DSV4_MODEL_TYPE or model_type.startswith("qwen")
+    return model_type in (DSV4_MODEL_TYPE, DSV41_MODEL_TYPE) or model_type.startswith("qwen")
 
 
 def _align_up_block_mb(raw_bytes: int) -> int:
@@ -54,15 +55,16 @@ def _per_token_elements(
     hidden_size: int,
     num_hash_layers: int,
     num_experts_per_tok: int,
+    num_engram_layers: int,
+    num_engram_cols: int,
 ) -> int:
-    if model_type == DSV4_MODEL_TYPE:
-        if num_hash_layers < 0 or num_experts_per_tok < 0:
-            raise LwdUcxBlockPolicyError(
-                "deepseek_v4 hash fields must be non-negative: "
-                f"num_hash_layers={num_hash_layers}, "
-                f"num_experts_per_tok={num_experts_per_tok}"
-            )
-        return hidden_size + 4 * num_hash_layers * num_experts_per_tok
+    if model_type in (DSV4_MODEL_TYPE, DSV41_MODEL_TYPE):
+        dims = (num_hash_layers, num_experts_per_tok, num_engram_layers, num_engram_cols)
+        if any(dim < 0 for dim in dims):
+            raise LwdUcxBlockPolicyError(f"{model_type} hash and Engram fields must be non-negative: {dims}")
+        hash_tail = 4 * num_hash_layers * num_experts_per_tok
+        engram_tail = 4 * num_engram_layers * num_engram_cols
+        return hidden_size + hash_tail + engram_tail
     return hidden_size
 
 
@@ -72,6 +74,8 @@ def resolve(
     hidden_size: int | None,
     num_hash_layers: int = 0,
     num_experts_per_tok: int = 0,
+    num_engram_layers: int = 0,
+    num_engram_cols: int = 0,
     max_num_batched_tokens: int,
     explicit_up_block_mb: int | None = None,
     fallback_up_block_mb: int = FALLBACK_UP_BLOCK_MB,
@@ -138,6 +142,8 @@ def resolve(
         hidden_size=int(hidden_size),
         num_hash_layers=int(num_hash_layers),
         num_experts_per_tok=int(num_experts_per_tok),
+        num_engram_layers=int(num_engram_layers),
+        num_engram_cols=int(num_engram_cols),
     )
     raw_bytes = max_num_batched_tokens * per_token * BF16_BYTES
     raw_mib = raw_bytes / float(1 << 20)
