@@ -284,10 +284,11 @@ class TestCloudPreemption(unittest.TestCase):
         )
         self.runner = cls()
         self.runner.worker = NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=self.stager)
+        self.runner.lwd_engram_inputs = None
 
-    def output(self, *req_computed):
+    def output(self, *req_computed, new_reqs=()):
         return NS(
-            scheduled_new_reqs=[],
+            scheduled_new_reqs=list(new_reqs),
             scheduled_cached_reqs=NS(
                 req_ids=[req_id for req_id, _ in req_computed],
                 num_computed_tokens=[computed for _, computed in req_computed],
@@ -303,6 +304,18 @@ class TestCloudPreemption(unittest.TestCase):
             2,
             1,
         )
+
+    def test_initial_bounded_replay_rewinds_before_base_update(self):
+        output = self.output(new_reqs=[NS(req_id="a", prompt_embeds=None, num_computed_tokens=1)])
+
+        self.assertEqual(self.runner._update_states(output), "base")
+        self.assertEqual(self.stager.events, [("rewind", "a", 1), ("base", 1)])
+
+    def test_initial_hit_without_replay_keeps_host_pointer(self):
+        output = self.output(new_reqs=[NS(req_id="a", prompt_embeds=None, num_computed_tokens=2)])
+
+        self.assertEqual(self.runner._update_states(output), "base")
+        self.assertEqual(self.stager.events, [("base", 2)])
 
     def test_self_hit_skips_forward_and_decode_does_not_skip(self):
         self.runner._update_states(self.output(("a", 3), ("decode", 9)))
