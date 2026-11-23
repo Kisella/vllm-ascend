@@ -486,7 +486,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # ------------------------------------------------------------------ #
 
     def _lwd_rewind_preempted_requests(self, scheduler_output: SchedulerOutput) -> None:
-        """Align host read pointers with scheduler rollbacks and prefix hits."""
+        """Align host read pointers with rollbacks, prefix hits, and bounded replay."""
         worker = self.worker
         if worker is None or not worker._lwd_is_early_recv_endpoint:
             return
@@ -494,7 +494,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if stager is None:
             return
         cached = scheduler_output.scheduled_cached_reqs
-        for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+        requests = [(req.req_id, req.num_computed_tokens) for req in scheduler_output.scheduled_new_reqs]
+        requests.extend(zip(cached.req_ids, cached.num_computed_tokens))
+        for req_id, new_computed in requests:
             # Each connection is staged only on its real endpoint rank. Other
             # TP ranks must not rewind a nonexistent local host descriptor.
             if stager.take_req(req_id) is None:
@@ -1112,9 +1114,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if engram is not None:
                 if engram_hashes is None:
                     raise RuntimeError(f"[Lwd][cloud-runner] missing UP Engram hashes for {window.req_id}")
-                # The record is created by the first chunk and holds the whole
-                # request's spans; later chunks must present none.
-                spans = self._lwd_image_spans.get(window.req_id, []) if window.start == 0 else []
+                # The first received chunk creates the record, even when a
+                # prefix hit makes its prompt offset nonzero.
+                spans = self._lwd_image_spans.get(window.req_id, [])
                 engram.add_prompt_chunk(
                     window.req_id,
                     window.start,
