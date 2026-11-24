@@ -634,3 +634,24 @@ def test_v2_full_lookup_uses_capture_bucket_events_inside_forward_context(runtim
     assert result["engram_pending"] is binding["engram_pending"]
     assert result["engram_mask_ready_event"] is binding["engram_mask_ready_event"]
     assert model.prepare_engram.call_args.kwargs["ready_events"] is binding["engram_pending"]
+
+
+def test_graph_producer_forwards_external_hash_rows(runtime) -> None:
+    model = make_model()
+    external_hashes = torch.ones(4, 2, 4, dtype=torch.int32)
+    external_rows = torch.tensor([True, True, False, False])
+    model.prepare_engram = Mock(return_value=({}, torch.zeros(4, dtype=torch.bool)))
+
+    with model.captured_engram_inputs(
+        torch.arange(4),
+        torch.arange(4),
+        torch.full((4, 2), -1),
+        torch.tensor([0, 4]),
+        torch.tensor([4]),
+        external_hashes,
+        external_rows,
+    ):
+        pass
+
+    assert model.prepare_engram.call_args.kwargs["external_hashes"] is external_hashes
+    assert model.prepare_engram.call_args.kwargs["external_rows"] is external_rows
