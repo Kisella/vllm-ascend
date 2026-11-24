@@ -91,6 +91,13 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         if self.lwd_engram_inputs is not None:
             self.lwd_engram_inputs.release(req_id)
 
+    def image_token_id_at(self, req_id: str, position: int) -> int | None:
+        spans = self._lwd_image_spans.get(req_id, ())
+        for start, length, token_id in zip(spans[::3], spans[1::3], spans[2::3]):
+            if start <= position < start + length:
+                return token_id
+        return None
+
     def _up_source_rank(self, connection: LwdConnectionId, ranks: list[int]) -> int:
         if self._up_src_ranks is None:
             return ranks[0]

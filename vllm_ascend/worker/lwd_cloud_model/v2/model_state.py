@@ -83,10 +83,11 @@ class LwdAscendCloudEngramModelState(LwdAscendCloudModelState, EngramModelState)
         dims = LwdEngramDims.from_model_config(self.model_config)
         if dims is None:
             raise ValueError("[LWD] Engram state requires a model with Engram layers")
+        self.lwd_embed_lookup = lwd_embed_lookup(model)
         self.lwd_engram_inputs = LwdEngramInputs(
             dims,
             device,
-            lwd_embed_lookup(model),
+            self.lwd_embed_lookup,
             self.max_num_tokens,
             self.max_num_reqs,
             vllm_config.num_speculative_tokens,
