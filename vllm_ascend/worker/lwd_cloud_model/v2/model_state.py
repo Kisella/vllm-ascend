@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelStateMixin
 from vllm.v1.worker.gpu.lwd.pinned_staging import LwdPinnedStaging
@@ -84,11 +84,12 @@ class LwdAscendCloudEngramModelState(LwdAscendCloudModelState, EngramModelState)
         if dims is None:
             raise ValueError("[LWD] Engram state requires a model with Engram layers")
         self.lwd_embed_lookup = lwd_embed_lookup(model)
+        max_capture = vllm_config.compilation_config.max_cudagraph_capture_size or 0
         self.lwd_engram_inputs = LwdEngramInputs(
             dims,
             device,
             self.lwd_embed_lookup,
-            self.max_num_tokens,
+            max(self.max_num_tokens, max_capture),
             self.max_num_reqs,
             vllm_config.num_speculative_tokens,
         )
@@ -138,10 +139,7 @@ class LwdAscendCloudEngramModelState(LwdAscendCloudModelState, EngramModelState)
         )
 
     def prepare_engram_inputs(self, input_batch: AscendInputBatch, req_states: RequestState) -> dict[str, Any]:
-        if self._cg_mode not in (None, CUDAGraphMode.NONE):
-            raise ValueError("[LWD] MRV2 DeepSeek V4.1 Engram currently requires cudagraph_mode=NONE")
         engram = self.lwd_engram_inputs
-        num_tokens = input_batch.num_tokens
         padded_tokens = input_batch.num_tokens_after_padding
         dummy = input_batch.is_dummy or self.kvpp_is_dummy_run or ring_state_update_skipped()
         if dummy:
@@ -152,14 +150,13 @@ class LwdAscendCloudEngramModelState(LwdAscendCloudModelState, EngramModelState)
                 input_batch.num_scheduled_tokens,
                 self._lwd_engram_staging_for("engram_row_codes", torch.int32, engram.row_codes_capacity),
             )
+        model_inputs = super().prepare_engram_inputs(input_batch, req_states)
         input_ids = engram.model_input_ids(input_batch.input_ids, padded_tokens)
-        model_inputs: dict[str, Any] = {"input_ids": input_ids}
+        model_inputs["input_ids"] = input_ids
         window = self.lookback_token_ids
         if window is None:
             return model_inputs
-        if dummy:
-            window.fill_(-1)
-        else:
+        if not dummy:
             engram.build_window(
                 window,
                 self._lwd_engram_batch_view(input_batch, req_states),
@@ -168,16 +165,9 @@ class LwdAscendCloudEngramModelState(LwdAscendCloudModelState, EngramModelState)
                 self._lwd_engram_staging_for("engram_window", torch.int64, engram.window_capacity),
             )
         model_inputs["lookback_token_ids"] = window
-        self._engram_inputs = {
-            "input_ids": input_ids[:num_tokens],
-            "positions": input_batch.positions[:num_tokens],
-            "padded_tokens": padded_tokens,
-            "lookback_token_ids": window,
-            "query_start_loc": None if dummy else input_batch.query_start_loc[: input_batch.num_reqs + 1],
-            "cg_mode": self._cg_mode,
-            "force_dummy": dummy,
-            "token_indices": None,
-            **engram.device_inputs(),
-        }
-        model_inputs.update(self.model.prepare_engram_graph_inputs(padded_tokens))
+        external_inputs = engram.device_inputs()
+        if self._engram_inputs is not None:
+            self._engram_inputs["input_ids"] = input_ids[: input_batch.num_tokens]
+            self._engram_inputs.update(external_inputs)
+        model_inputs.update(external_inputs)
         return model_inputs

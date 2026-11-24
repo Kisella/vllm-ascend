@@ -1295,7 +1295,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
 
     @contextmanager
-    def captured_engram_inputs(self, input_ids, positions, lookback_token_ids, query_start_loc, valid_token_count):
+    def captured_engram_inputs(
+        self,
+        input_ids,
+        positions,
+        lookback_token_ids,
+        query_start_loc,
+        valid_token_count,
+        external_hashes=None,
+        external_rows=None,
+    ):
         """Capture producer, consumer waits and stream join in the same graph.
 
         Unlike the graph-external protocol, replay only stages fixed-address
@@ -1331,6 +1340,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     mask_output_buffer=mask_buffer,
                     mask_ready_event=mask_ready,
                     valid_token_count=valid_token_count,
+                    external_hashes=external_hashes,
+                    external_rows=external_rows,
                 )
             yield {
                 "engram_lookups": buffers,
@@ -1789,10 +1800,18 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         engram_mask_ready_event=None,
         engram_query_start_loc=None,
         engram_valid_token_count=None,
+        external_hashes=None,
+        external_rows=None,
     ):
         if engram_query_start_loc is not None:
             with self.model.captured_engram_inputs(
-                input_ids, positions, lookback_token_ids, engram_query_start_loc, engram_valid_token_count
+                input_ids,
+                positions,
+                lookback_token_ids,
+                engram_query_start_loc,
+                engram_valid_token_count,
+                external_hashes,
+                external_rows,
             ) as graph_inputs:
                 return self.model(
                     input_ids,

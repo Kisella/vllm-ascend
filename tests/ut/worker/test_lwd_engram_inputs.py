@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -113,17 +114,28 @@ def test_v2_up_engram_segments_stage_and_inject() -> None:
     _stage_v2_engram_prompt()
 
 
-def test_v2_eager_engram_rebuilds_prefill_and_decode_inputs() -> None:
+def test_v2_engram_rebuilds_prefill_decode_and_full_inputs(monkeypatch) -> None:
     _, engram = _stage_v2_engram_prompt()
     state = LwdAscendCloudEngramModelState.__new__(LwdAscendCloudEngramModelState)
     state._cg_mode = CUDAGraphMode.NONE
     state.kvpp_is_dummy_run = False
     state.device = torch.device("cpu")
+    state.pcp_context = None
     state.lwd_engram_inputs = engram
     state.lookback_token_ids = torch.full((1, 2), -1, dtype=torch.int32)
     state._lwd_engram_staging = {}
     state.model = SimpleNamespace(prepare_engram_graph_inputs=lambda num_tokens: {})
-    req_states = SimpleNamespace(prompt_len=SimpleNamespace(np=np.array([2], dtype=np.int32)))
+    req_states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([2], dtype=np.int32)),
+        all_token_ids=SimpleNamespace(gpu=torch.zeros((1, 8), dtype=torch.int32)),
+        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int32)),
+    )
+    gather_kernel = MagicMock()
+    gather_kernel.__getitem__.return_value = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        "vllm_ascend.ops.triton.engram_lookback._gather_lookback_kernel",
+        gather_kernel,
+    )
 
     def batch(start: int, token_ids: list[int]) -> SimpleNamespace:
         count = len(token_ids)
@@ -136,6 +148,7 @@ def test_v2_eager_engram_rebuilds_prefill_and_decode_inputs() -> None:
             num_scheduled_tokens=np.array([count], dtype=np.int32),
             num_computed_tokens_np=np.array([start], dtype=np.int32),
             idx_mapping_np=np.array([0]),
+            idx_mapping=torch.tensor([0]),
             input_ids=torch.tensor(token_ids, dtype=torch.int32),
             positions=torch.arange(start, start + count, dtype=torch.int64),
             query_start_loc=torch.tensor([0, count], dtype=torch.int32),
@@ -154,3 +167,19 @@ def test_v2_eager_engram_rebuilds_prefill_and_decode_inputs() -> None:
     assert decode["lookback_token_ids"][0].tolist() == [1, 0]
     assert engram.device_inputs() == {}
     assert state._engram_inputs["input_ids"].data_ptr() == decode["input_ids"].data_ptr()
+
+    engram.end_step()
+    state._engram_inputs = None
+    state._cg_mode = CUDAGraphMode.FULL
+    state._engram_graph_inputs = {
+        "engram_query_start_loc": torch.zeros(2, dtype=torch.int32),
+        "engram_valid_token_count": torch.zeros(1, dtype=torch.int32),
+    }
+
+    full = state.prepare_engram_inputs(batch(0, [99, 99]), req_states)
+
+    assert full["input_ids"].tolist() == [0, 0]
+    assert full["external_rows"][:2].all()
+    assert full["external_hashes"].shape == (2, 1, 2)
+    assert full["engram_query_start_loc"].tolist() == [0, 2]
+    assert full["engram_valid_token_count"].item() == 2
