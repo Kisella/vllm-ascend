@@ -6,7 +6,9 @@ import torch
 from vllm.v1.worker.gpu.lwd.model_runner import LwdCloudModelRunnerMixin
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 
+from vllm_ascend.models.deepseek_v41.engram.model_state import EngramModelState
 from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
+    LwdAscendCloudEngramModelState,
     LwdAscendCloudMambaHybridModelState,
     LwdAscendCloudModelState,
 )
@@ -38,6 +40,7 @@ class LwdAscendCloudModelRunnerV2(LwdCloudModelRunnerMixin, NPUModelRunner):
         return {
             AscendModelState: LwdAscendCloudModelState,
             AscendMambaHybridModelState: LwdAscendCloudMambaHybridModelState,
+            EngramModelState: LwdAscendCloudEngramModelState,
         }
 
     def _install_lwd_model_wrapper(self) -> None:

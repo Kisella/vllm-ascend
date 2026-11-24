@@ -19,10 +19,12 @@ from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelStateMixin
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.models.deepseek_v41.engram.model_state import EngramModelState
 from vllm_ascend.worker.lwd_cloud_model.v2.model_runner import (
     LwdAscendCloudModelRunnerV2,
 )
 from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
+    LwdAscendCloudEngramModelState,
     LwdAscendCloudMambaHybridModelState,
     LwdAscendCloudModelState,
 )
@@ -143,7 +145,7 @@ def test_qwen35_full_attention_keeps_default_lwd_state(tmp_path: Path) -> None:
     assert type(state) is LwdAscendCloudModelState
 
 
-def test_model_specific_state_is_not_replaced_by_lwd_hybrid(tmp_path: Path) -> None:
+def test_model_specific_mamba_state_uses_lwd_hybrid(tmp_path: Path) -> None:
     vllm_config = _cloud_config(tmp_path, "linear_attention")
 
     class ModelWithStateOverride(torch.nn.Module):
@@ -152,7 +154,17 @@ def test_model_specific_state_is_not_replaced_by_lwd_hybrid(tmp_path: Path) -> N
 
     state = _init_model_state(vllm_config, ModelWithStateOverride())
 
-    assert type(state) is AscendMambaHybridModelState
+    assert type(state) is LwdAscendCloudMambaHybridModelState
+
+
+def test_engram_state_composes_lwd_and_native_execution() -> None:
+    runner = LwdAscendCloudModelRunnerV2.__new__(LwdAscendCloudModelRunnerV2)
+
+    overrides = runner.lwd_model_state_overrides()
+
+    assert overrides[EngramModelState] is LwdAscendCloudEngramModelState
+    assert LwdAscendCloudEngramModelState.prepare_inputs_embeds is LwdCloudModelStateMixin.prepare_inputs_embeds
+    assert LwdAscendCloudEngramModelState.prepare_attn is EngramModelState.prepare_attn
 
 
 class _PromptStage:

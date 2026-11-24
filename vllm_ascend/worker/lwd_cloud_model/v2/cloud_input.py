@@ -14,10 +14,15 @@ from vllm.v1.worker.gpu.lwd.cloud_input import (
     LwdStagedWindow,
 )
 
+from vllm_ascend.worker.lwd_cloud_model.lwd_engram_inputs import (
+    LwdEngramInputs,
+    lwd_check_image_placeholder_spans,
+)
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
 )
+from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 
 class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
@@ -39,7 +44,11 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
             prompt_stage=prompt_stage,
         )
         self.lwd_hash_state: LwdHashRoutingState | None = None
+        self.lwd_engram_inputs: LwdEngramInputs | None = None
+        self._lwd_image_spans: dict[str, list[int]] = {}
+        self._lwd_prompt_lens: dict[str, int] = {}
         config = vllm_config.model_config.hf_config
+        self.up_payload_layout = LwdUpPayloadLayout.from_hf_config(hidden_size, config)
         num_hash_layers = hash_layer_count(config)
         self.num_hash_layers = num_hash_layers
         self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
@@ -65,6 +74,22 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
             self._lwd_hash_token_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
             self._lwd_hash_placeholder_ids = torch.zeros_like(self._lwd_hash_token_ids)
             self._lwd_hash_step_tokens: int | None = None
+
+    def bind_engram_inputs(self, engram_inputs: LwdEngramInputs) -> None:
+        self.lwd_engram_inputs = engram_inputs
+
+    def add_engram_request(self, req_id: str, prompt_len: int, spans: list[int]) -> None:
+        lwd_check_image_placeholder_spans(req_id, spans, self.lwd_engram_inputs is not None)
+        self._lwd_prompt_lens[req_id] = prompt_len
+        self._lwd_image_spans.pop(req_id, None)
+        if spans:
+            self._lwd_image_spans[req_id] = spans
+
+    def release_engram_request(self, req_id: str) -> None:
+        self._lwd_prompt_lens.pop(req_id, None)
+        self._lwd_image_spans.pop(req_id, None)
+        if self.lwd_engram_inputs is not None:
+            self.lwd_engram_inputs.release(req_id)
 
     def _up_source_rank(self, connection: LwdConnectionId, ranks: list[int]) -> int:
         if self._up_src_ranks is None:
@@ -130,7 +155,7 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         next_prompt_embeds.index_copy_(0, index_tensor, lookahead)
 
     def _elements_per_row(self) -> int:
-        return self.hidden_size + 4 * self.num_hash_layers * self.num_experts_per_tok
+        return self.up_payload_layout.bytes_per_token
 
     def stage_prompt_window(
         self,
@@ -168,41 +193,60 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         device_payload: torch.Tensor,
         embed_offset: int,
     ) -> None:
-        if self.lwd_hash_state is None:
-            return
-        tail_per_row = 4 * self.num_hash_layers * self.num_experts_per_tok
         tail_offset = embed_offset
         assert self.prompt_stage is not None
-        for window in plan:
-            request = self.prompt_stage.take_req(window.req_id)
-            assert request is not None
-            tail_start, _ = request.tail_range_at(0, window.start, window.rows)
-            numel = window.rows * tail_per_row
-            device_payload[tail_offset : tail_offset + numel].copy_(
-                request.host[tail_start : tail_start + numel], non_blocking=True
-            )
-            tail_offset += numel
+        for segment_index, per_row in enumerate(self.up_payload_layout.tail_sizes_per_token):
+            if per_row == 0:
+                continue
+            for window in plan:
+                request = self.prompt_stage.take_req(window.req_id)
+                assert request is not None
+                tail_start, _ = request.tail_range_at(segment_index, window.start, window.rows)
+                numel = window.rows * per_row
+                device_payload[tail_offset : tail_offset + numel].copy_(
+                    request.host[tail_start : tail_start + numel], non_blocking=True
+                )
+                tail_offset += numel
 
     def _inject_window_extras(
         self,
         staged: LwdStagedWindow,
         view: LwdCloudBatchView,
     ) -> None:
-        if self.lwd_hash_state is None:
-            return
+        layout = self.up_payload_layout
+        if layout.num_engram_layers and self.lwd_engram_inputs is None:
+            raise RuntimeError("[LWD] MRV2 received Engram hashes without the Engram state")
         total_rows = sum(window.rows for window in staged.plan)
-        tail_per_row = 4 * self.num_hash_layers * self.num_experts_per_tok
+        hash_offset = total_rows * self.hidden_size
+        engram_offset = hash_offset + total_rows * layout.hash_bytes_per_token
         row = 0
         for window in staged.plan:
-            tail_start = total_rows * self.hidden_size + row * tail_per_row
-            tail_end = tail_start + window.rows * tail_per_row
-            expert_ids = self._decode_expert_ids(staged.device_payload[tail_start:tail_end], window.rows)
-            self.lwd_hash_state.add_chunk(
-                window.req_id,
-                int(view.prefill_len_np[window.req_index]),
-                window.start,
-                expert_ids,
-            )
+            if self.lwd_hash_state is not None:
+                tail_start = hash_offset + row * layout.hash_bytes_per_token
+                tail_end = tail_start + window.rows * layout.hash_bytes_per_token
+                expert_ids = self._decode_expert_ids(staged.device_payload[tail_start:tail_end], window.rows)
+                self.lwd_hash_state.add_chunk(
+                    window.req_id,
+                    int(view.prefill_len_np[window.req_index]),
+                    window.start,
+                    expert_ids,
+                )
+            if self.lwd_engram_inputs is not None:
+                tail_start = engram_offset + row * layout.engram_bytes_per_token
+                tail_end = tail_start + window.rows * layout.engram_bytes_per_token
+                hashes = self._decode_engram_hashes(staged.device_payload[tail_start:tail_end], window.rows)
+                embed_start = row * self.hidden_size
+                embed_end = embed_start + window.rows * self.hidden_size
+                embeds = staged.device_payload[embed_start:embed_end].view(window.rows, self.hidden_size)
+                self.lwd_engram_inputs.add_prompt_chunk(
+                    window.req_id,
+                    window.start,
+                    self._lwd_prompt_lens[window.req_id],
+                    self._lwd_image_spans.get(window.req_id, []),
+                    embeds,
+                )
+                output = int(view.query_start_loc_np[window.req_index])
+                self.lwd_engram_inputs.write_prompt_hashes(window.req_index, output, hashes)
             row += window.rows
 
     def _decode_expert_ids(self, seg: torch.Tensor, rows: int) -> torch.Tensor:
@@ -211,6 +255,15 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
             .to(torch.uint8)
             .view(torch.int32)
             .view(rows, self.num_hash_layers, self.num_experts_per_tok)
+        )
+
+    def _decode_engram_hashes(self, seg: torch.Tensor, rows: int) -> torch.Tensor:
+        layout = self.up_payload_layout
+        return (
+            seg.contiguous()
+            .to(torch.uint8)
+            .view(torch.int32)
+            .view(rows, layout.num_engram_layers, layout.num_engram_cols)
         )
 
     def clear_hash_step(self) -> None:
