@@ -9,7 +9,7 @@ from vllm.config import VllmConfig
 from vllm.config.device import DeviceConfig
 from vllm.config.lwd import LwdConnectionId
 from vllm.forward_context import set_forward_context
-from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView
+from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView, LwdStagedWindow
 from vllm.v1.worker.gpu.lwd.down_payload import LwdDownPayloadBuilder
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
@@ -96,6 +96,33 @@ def test_real_hash_batch_preserves_ids_and_fixed_addresses() -> None:
             assert wrapper.compute_logits(torch.tensor([2])).item() == 4
 
     assert model.logits_calls == 2
+
+
+def test_prompt_windows_populate_hash_ids_before_batch_assembly(monkeypatch) -> None:
+    assembler = _hash_assembler()
+    embeds = torch.zeros((4, 2), dtype=torch.bfloat16)
+    lookahead = torch.zeros((1, 2), dtype=torch.bfloat16)
+    monkeypatch.setattr("torch.cuda.Event", lambda: SimpleNamespace(record=lambda: None))
+
+    def harvest(plan, next_prompt_embeds, view, connection):
+        ids = torch.tensor([[[3 + plan[0].start]], [[4 + plan[0].start]]], dtype=torch.int32)
+        tail = ids.contiguous().view(torch.uint8).flatten().to(torch.bfloat16)
+        payload = torch.cat([torch.ones(4, dtype=torch.bfloat16), tail])
+        return LwdStagedWindow(payload, 0, plan)
+
+    monkeypatch.setattr(assembler, "_harvest_window", harvest)
+    addresses = (assembler._lwd_hash_experts.data_ptr(), assembler._lwd_hash_prompt_mask.data_ptr())
+    for start in (0, 2):
+        view = _view()._replace(num_computed_tokens_np=np.array([start], dtype=np.int32))
+        assembler.stage_prompt_window(view, embeds, lookahead, torch.tensor([0, 0]))
+        assert assembler._lwd_hash_experts[:2, 0, 0].tolist() == [3 + start, 4 + start]
+        assert assembler._lwd_hash_prompt_mask.tolist() == [True, True, False, False]
+        assert embeds[:2].tolist() == [[1, 1], [1, 1]]
+        assert (assembler._lwd_hash_experts.data_ptr(), assembler._lwd_hash_prompt_mask.data_ptr()) == addresses
+
+    assembler.stage_prompt_window(_view(), embeds, lookahead, torch.tensor([5, 6]))
+    assert not assembler._lwd_hash_prompt_mask.any()
+    assert assembler._lwd_hash_token_ids[:2].tolist() == [5, 6]
 
 
 def test_dummy_hash_batch_does_not_reuse_real_mask() -> None:
