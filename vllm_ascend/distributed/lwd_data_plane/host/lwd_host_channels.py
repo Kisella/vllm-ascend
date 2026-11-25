@@ -48,6 +48,10 @@ from vllm.config.lwd.topology import (
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import LwdUcxListener
+from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
+    register_data_plane_add_hook,
+)
+
 from vllm_ascend.distributed.lwd_data_plane.host import ucx_block_policy
 from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
     BLOCKS_PER_CHANNEL,
@@ -55,6 +59,16 @@ from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
     LwdNpuUcxChannelIoConfig,
 )
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+
+# Elastic partial start (cloud side): once the FIRST host link is up, the
+# remaining planned links share this straggler grace, then the edge
+# proceeds with the connected subset (the yaml may plan more clouds than
+# are launched). The first-link window stays long -- a co-started cloud
+# binds its listener only partway into its own init. A missing link's
+# supervision thread keeps reconnecting and the link is adopted whenever
+# the cloud starts; zero links still fails fast.
+_STRAGGLER_GRACE_S = 60.0
+_STRAGGLER_POLL_S = 0.1
 
 # Bounded submit-time wait for a data-plane link to leave a
 # broken/reconnect window (peer restart, network break): a send landing
@@ -76,6 +90,16 @@ _UCX_CHANNELS_INITIALIZED = False
 # and get_current_vllm_config() raises at request time after vLLM clears it, so
 # request-path readers must use the cache.
 _CACHED_COMM: str | None = None
+
+# The link-building inputs captured at channel-init time for the runtime
+# link addition (elastic scale-out): get_current_vllm_config() is gone by
+# then, and the values are process-lifetime constants anyway.
+_CACHED_PLAN: LwdHostLinkPlan | None = None
+_ALLOCATED_MB = 0
+"""Host data-plane memory already committed to built links, MiB: the
+startup plan's need plus every runtime-added pair. The budget gate at
+init and the per-connection refusal at runtime share this ledger."""
+
 
 @dataclass(frozen=True)
 class LwdHostLinkPlan:
@@ -435,6 +459,13 @@ def lwd_init_host_channels() -> None:
     )
 
     register_cloud_restart_hook(_teardown_cloud_dp)
+    global _CACHED_PLAN, _ALLOCATED_MB
+    _CACHED_PLAN = plan
+    _ALLOCATED_MB = need_mb
+    # The runtime link addition (elastic scale-out, phase C): registering
+    # here means the engine's notify can only ever reach an initialized
+    # plane, in this process, on this device.
+    register_data_plane_add_hook(lwd_add_runtime_connection)
     _UCX_CHANNELS_INITIALIZED = True
 
 
@@ -517,6 +548,81 @@ def _build_connection_ios(conn: LwdDPConnection, listener: LwdUcxListener | None
         raise
 
 
+def lwd_add_runtime_connection(conn: LwdDPConnection) -> bool:
+    """The runtime half of ``lwd_init_host_channels`` (elastic scale-out):
+    one connection's two UCX links, callable mid-run on the engine thread
+    once the topology watch detected the addition. Refuses — never raises
+    — on an uninitialized plane, a missing data_port, a missing shared
+    listener (cloud), or a budget shortfall; a refusal keeps the
+    connection control-plane only (the engine retries on the next
+    topology change). Idempotent: an already-built connection reports
+    True.
+
+    Role-aware (C-3): the EDGE adds a connect-out pair (no listener);
+    the CLOUD adds a serve pair on its DP's SHARED listener — the token
+    registers through ``serve_via`` (the locked route table accepts
+    mid-run registration), and the already-retrying edge's next UHC1
+    handshake completes."""
+    plan = _CACHED_PLAN
+    if plan is None or not _UCX_CHANNELS_INITIALIZED:
+        logger.error(
+            "[LWD] runtime link %s refused: host channels are not initialized",
+            conn.connection_id,
+        )
+        return False
+    idempotent_key = (
+        conn.connection_id.edge_id,
+        conn.connection_id.cloud_id,
+        conn.connection_id.dp_idx,
+        LwdChannelType.UP,
+        "send" if plan.role == "edge" else "recv",
+    )
+    if idempotent_key in _UCX_IOS:
+        return True  # Already built (an idempotent replay).
+    listener: LwdUcxListener | None = None
+    if plan.role == "cloud":
+        listener = _UCX_LISTENERS.get((conn.connection_id.cloud_id, conn.connection_id.dp_idx))
+        if listener is None:
+            logger.error(
+                "[LWD] runtime link %s refused: no shared listener for "
+                "cloud=%d dp=%d (the cloud DP's init must bind one)",
+                conn.connection_id,
+                conn.connection_id.cloud_id,
+                conn.connection_id.dp_idx,
+            )
+            return False
+    global _ALLOCATED_MB
+    pair_mb = BLOCKS_PER_CHANNEL * (plan.up_block_mb + plan.down_block_mb)
+    if _ALLOCATED_MB + pair_mb > _HOST_MEM_BUDGET_MB:
+        logger.error(
+            "[LWD] runtime link %s refused: the per-rank host budget would "
+            "reach %d MiB (limit %d); lower the block sizes in the "
+            "topology file",
+            conn.connection_id,
+            _ALLOCATED_MB + pair_mb,
+            _HOST_MEM_BUDGET_MB,
+        )
+        return False
+    try:
+        _build_connection_ios(conn, listener, plan)
+    except Exception:
+        logger.exception("[LWD] runtime link %s build failed", conn.connection_id)
+        return False
+    _ALLOCATED_MB += pair_mb
+    # Rare success event (once per runtime connection): kept at error so
+    # error-only deployments still see the data-plane build.
+    logger.error(
+        "[LWD] runtime link built: connection %s -> %s:%s (role=%s, host budget %d/%d MiB)",
+        conn.connection_id,
+        conn.cloud.addr,
+        conn.cloud.data_port,
+        plan.role,
+        _ALLOCATED_MB,
+        _HOST_MEM_BUDGET_MB,
+    )
+    return True
+
+
 def _io(edge_id: int, cloud_id: int, dp_idx: int, channel: LwdChannelType, op: str) -> LwdNpuUcxChannelIo:
     key = (edge_id, cloud_id, dp_idx, channel, op)
     try:
@@ -531,10 +637,17 @@ def _io(edge_id: int, cloud_id: int, dp_idx: int, channel: LwdChannelType, op: s
 
 
 def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
-    """Wait for every LOCAL link's readiness -- no cross-world barrier
-    exists to join in host comm (old-branch semantics: the cloud reports
-    its listener bound and adopts edges asynchronously; the edge waits
-    for every cloud link, bounded by HS_TIMEOUT_S + 5)."""
+    """Wait for the LOCAL links' readiness -- no cross-world barrier
+    exists in host comm (old-branch semantics: the cloud reports its
+    listener bound and adopts edges asynchronously).
+
+    Elastic partial start: the FIRST link gets the long window (a
+    slow-starting cloud is still binding its listener); the remaining
+    links then share a short straggler grace, and the edge proceeds with
+    the connected subset -- the yaml may plan more clouds than are
+    launched. A missing link's supervision thread keeps reconnecting, so
+    the link comes up whenever its cloud starts. Zero links within the
+    window is a deployment error and still fails fast."""
     if timeout is None:
         from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
             _HS_TIMEOUT_S,
@@ -547,16 +660,39 @@ def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
     import time as _time
 
     t0 = _time.perf_counter()
-    for (edge_id, cloud_id, dp_idx, channel, op), io in _UCX_IOS.items():
-        if not io.wait_ready(timeout=timeout):
-            raise RuntimeError(
-                f"[LWD][handshake] host link not ready: "
-                f"edge={edge_id} cloud={cloud_id} dp_idx={dp_idx} "
-                f"channel={channel.value} op={op} within {timeout:.0f}s"
-            )
+    # Phase A: the first link within the long window.
+    first_deadline = t0 + timeout
+    ready = False
+    while _time.perf_counter() < first_deadline:
+        if any(io.wait_ready(timeout=0) for io in _UCX_IOS.values()):
+            ready = True
+            break
+        _time.sleep(_STRAGGLER_POLL_S)
+    if not ready:
+        missing = "; ".join(f"edge={e} cloud={c} dp_idx={d} channel={ch.value} op={op}" for e, c, d, ch, op in _UCX_IOS)
+        raise RuntimeError(f"[LWD][handshake] no host link became ready within {timeout:.0f}s: {missing}")
+    # Phase B: the remaining links share the straggler grace (the first
+    # missing link consumes it; the rest time out immediately after).
+    grace_deadline = _time.perf_counter() + _STRAGGLER_GRACE_S
+    not_ready = [
+        (edge_id, cloud_id, dp_idx, channel, op)
+        for (edge_id, cloud_id, dp_idx, channel, op), io in _UCX_IOS.items()
+        if not io.wait_ready(timeout=max(0.0, grace_deadline - _time.perf_counter()))
+    ]
+    if not_ready:
+        logger.warning(
+            "[LWD][handshake] proceeding with %d of %d host links (elastic "
+            "partial start); missing %s will serve once the cloud starts "
+            "-- supervision threads keep reconnecting",
+            len(_UCX_IOS) - len(not_ready),
+            len(_UCX_IOS),
+            "; ".join(f"edge={e} cloud={c} dp={d}/{ch.value}/{op}" for e, c, d, ch, op in not_ready),
+        )
     logger.info(
-        "[LWD][handshake] OK data_plane=host links=%d %.1fms (edge-side wait_ready only, no cross-world barrier)",
+        "[LWD][handshake] OK data_plane=host links=%d ready=%d %.1fms "
+        "(edge-side wait_ready only, elastic partial start)",
         len(_UCX_IOS),
+        len(_UCX_IOS) - len(not_ready),
         (_time.perf_counter() - t0) * 1000.0,
     )
 
@@ -598,6 +734,8 @@ def lwd_destroy_host_channels(timeout: float = 2.0) -> None:
         except Exception:
             logger.warning("[LWD] failed to close host listener %s", key)
     _UCX_LISTENERS.clear()
-    global _CACHED_COMM
+    global _CACHED_COMM, _CACHED_PLAN, _ALLOCATED_MB
     _CACHED_COMM = None
+    _CACHED_PLAN = None
+    _ALLOCATED_MB = 0
     _UCX_CHANNELS_INITIALIZED = False

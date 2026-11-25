@@ -353,6 +353,83 @@ class LwdCloudWorker(LwdWorkerBase):
             return None
         return done_mq.export_handle()
 
+    def lwd_attach_runtime_connection_mqs(
+        self, connection_id: ConnectionId, hint_handle_str: str | None = None
+    ) -> Handle | None:
+        """Runtime-added connection (elastic scale-out, C-4): attach the
+        hint MQ, create the done MQ, add both to the per-connection
+        dicts, and return the done MQ's handle for the engine's reader.
+
+        The hint MQ's handle arrives EXPLICITLY via the RPC argument:
+        env vars do NOT cross the MultiprocExecutor process boundary at
+        runtime (they only work at startup where workers inherit the
+        engine's env). Only the endpoint Worker (the one that runs the
+        early-recv thread with actual connections) does the work; others
+        return None.
+
+        Idempotent: an already-attached connection just returns its
+        existing done MQ handle."""
+        if not getattr(self, "_lwd_early_recv_connections", ()):
+            return None  # not the endpoint Worker
+        if connection_id in self._irecv_hint_mqs:
+            done_mq = self._irecv_done_mqs.get(connection_id)
+            if done_mq is not None:
+                return done_mq.export_handle()
+            return None
+        from vllm.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            _decode_handle,
+            create_report_mq,
+        )
+
+        if hint_handle_str is None:
+            return None  # the engine didn't pass the handle (wiring bug)
+        hint_mq = MessageQueue.create_from_handle(_decode_handle(hint_handle_str), 0)
+        done_mq = create_report_mq()
+        self._irecv_hint_mqs[connection_id] = hint_mq
+        self._irecv_done_mqs[connection_id] = done_mq
+        return done_mq.export_handle()
+
+    def lwd_build_runtime_connection(self, conn: Any) -> bool | None:
+        """Build one runtime connection's UCX serve pair (elastic
+        scale-out, cloud_share C-3) and extend the worker's connection
+        state on EVERY TP rank. The EngineCore calls this via
+        ``collective_rpc`` on all Workers — the runner's
+        ``request_connection`` searches ``_lwd_connections`` by edge_id
+        on every rank, so the state extension cannot be endpoint-only.
+        The UCX build itself is endpoint-only (the listener owner);
+        others return None (``not my job``, distinct from False
+        ``build refused``)."""
+        from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
+
+        connection_id = conn.connection_id
+        # State extension on ALL Workers: the model runner on every TP
+        # rank resolves requests to connections via this tuple, and the
+        # harvest path subscripts _lwd_up_srcanks on every rank too.
+        if connection_id not in self._lwd_connections:
+            self._lwd_connections = (*self._lwd_connections, connection_id)
+            if hasattr(self, "_lwd_up_src_ranks"):
+                # Host comm maps every connection to the TP0 rank.
+                from vllm.distributed.parallel_state import get_tp_group
+
+                self._lwd_up_src_ranks[connection_id] = get_tp_group().ranks[0]
+
+        if not lwd_host_channels._UCX_LISTENERS:
+            return None  # not the endpoint Worker; state already extended
+        result = lwd_host_channels.lwd_add_runtime_connection(conn)
+        if result is True:
+            # Early-recv state: only the endpoint Worker consumes hints
+            # for this connection (the MQ attach RPC handles the MQs).
+            if connection_id not in self._lwd_early_recv_connections:
+                self._lwd_early_recv_connections = (
+                    *self._lwd_early_recv_connections,
+                    connection_id,
+                )
+        return result
+
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
         report completions.
@@ -373,8 +450,13 @@ class LwdCloudWorker(LwdWorkerBase):
             self.device,
             "attached" if any(mq is not None for mq in self._irecv_hint_mqs.values()) else "none",
         )
-        hint_mqs = {connection: mq for connection, mq in self._irecv_hint_mqs.items() if mq is not None}
         while not self._lwd_early_recv_stop.is_set():
+            # Per-iteration snapshot: runtime-added connections (C-4)
+            # join the loop on the next tick. tuple(dict.items())
+            # completes in C — a Python-level iteration would raise on
+            # the engine thread's concurrent insert.
+            hint_mqs = dict(tuple(self._irecv_hint_mqs.items()))
+            hint_mqs = {connection: mq for connection, mq in hint_mqs.items() if mq is not None}
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
                     continue

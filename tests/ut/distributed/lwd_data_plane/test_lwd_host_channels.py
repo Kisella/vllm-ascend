@@ -108,6 +108,8 @@ def _reset_host_channel_state() -> Iterator[None]:
     lwd_host_channels._UCX_IOS.clear()
     lwd_host_channels._UCX_LISTENERS.clear()
     lwd_host_channels._UCX_CHANNELS_INITIALIZED = False
+    lwd_host_channels._CACHED_PLAN = None
+    lwd_host_channels._ALLOCATED_MB = 0
 
 
 def _cloud_share_topology(*, sidecar: bool = False) -> LwdTopology:
@@ -578,3 +580,219 @@ def test_linked_teardown_hook_fails_only_the_restarted_cloud(monkeypatch: pytest
     assert ios[(0, 0, 0, DOWN, "recv")].forced_teardowns == []
     # A verdict without local IOs is a silent no-op (another edge's cloud).
     teardown(9, 9, "unrelated")
+
+
+# --------------------------------------------------------------------- #
+# Runtime link addition (elastic scale-out, phase C)                     #
+# --------------------------------------------------------------------- #
+
+
+def _runtime_add_connection() -> LwdDPConnection:
+    """Pair 1's connection of the edge_share fixture: absent from the
+    startup plan, added at runtime."""
+    topology = _edge_share_topology()
+    (connection,) = topology.connections("edge", 1)
+    return connection
+
+
+def _run_edge_init_with_pair_zero_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot the shared edge engine with only pair 0 wired, as if the yaml
+    that started it planned a single instance."""
+    topology = _edge_share_topology()
+    (pair_zero,) = topology.connections("edge", 0)
+    _run_init(
+        monkeypatch,
+        topology,
+        role="edge",
+        instance_id=0,
+        connections=(pair_zero,),
+    )
+
+
+def test_runtime_add_builds_both_links_within_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime half of the bootstrap: one connection -> two IOs (UP
+    send / DOWN recv), both carrying the connection's token and restart
+    closures; the ledger grows by exactly one pair. Idempotent on
+    replay."""
+    _run_edge_init_with_pair_zero_only(monkeypatch)
+    connection = _runtime_add_connection()
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+    ios = lwd_host_channels._UCX_IOS
+    for channel, op in ((UP, "send"), (DOWN, "recv")):
+        key = (1, 1, 0, channel, op)
+        assert key in ios, key
+        assert ios[key].config.token == lwd_host_channels._link_token(1, 1, 0, channel)
+        assert ios[key].peer_restart_cbs, "restart closures registered"
+    # init pair (4*(32+32)) + runtime pair.
+    assert lwd_host_channels._ALLOCATED_MB == 2 * 4 * (32 + 32)
+    # A replay is an idempotent True: no third pair of IOs.
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+    assert len(ios) == 4
+
+
+def test_runtime_add_refuses_when_the_budget_is_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shortfall refuses THE CONNECTION (fail-fast per instance), leaves
+    the registry and the ledger untouched -- the engine keeps serving on
+    its startup links."""
+    _run_edge_init_with_pair_zero_only(monkeypatch)
+    monkeypatch.setattr(lwd_host_channels, "_HOST_MEM_BUDGET_MB", 4 * (32 + 32) + 1)
+    assert lwd_host_channels.lwd_add_runtime_connection(_runtime_add_connection()) is False
+    assert len(lwd_host_channels._UCX_IOS) == 2
+    assert lwd_host_channels._ALLOCATED_MB == 4 * (32 + 32)
+
+
+def test_runtime_add_refuses_an_uninitialized_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert lwd_host_channels.lwd_add_runtime_connection(_runtime_add_connection()) is False
+    assert lwd_host_channels._UCX_IOS == {}
+
+
+def _runtime_add_cloud_connection() -> LwdDPConnection:
+    return LwdDPConnection(
+        LwdConnectionId(1, 0, 0),
+        LwdDP(dp_idx=0, addr="10.0.0.2"),
+        LwdDP(dp_idx=0, addr="10.1.0.1", ctrl_port=7000, data_port=5560),
+    )
+
+
+def _run_cloud_init_with_pair_zero_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _FakeListener:
+    """Boot the cloud with edge0 only; edge1 is a genuine runtime addition."""
+    topology = _cloud_share_topology()
+    (pair_zero,) = (
+        connection for connection in topology.connections("cloud", 0) if connection.connection_id.edge_id == 0
+    )
+    (listener,) = _run_init(
+        monkeypatch,
+        topology,
+        role="cloud",
+        instance_id=0,
+        connections=(pair_zero,),
+    )
+    return listener
+
+
+def test_runtime_add_builds_a_cloud_pair_on_the_shared_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-3: the cloud builds its serve pair on the shared listener at
+    runtime — UP recv / DOWN send, both registered via serve_via (the
+    token lands in the listener's locked route table), so the already
+    retrying edge's next UHC1 handshake completes."""
+    listener = _run_cloud_init_with_pair_zero_only(monkeypatch)
+    connection = _runtime_add_cloud_connection()
+    ios = lwd_host_channels._UCX_IOS
+    assert len(ios) == 2
+    assert (1, 0, 0, UP, "recv") not in ios
+
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+
+    # The cloud's serve pair: UP recv / DOWN send on the shared listener.
+    assert (1, 0, 0, UP, "recv") in ios, "UP recv registered"
+    assert (1, 0, 0, DOWN, "send") in ios, "DOWN send registered"
+    for channel in (UP, DOWN):
+        op = "recv" if channel is UP else "send"
+        io = ios[(1, 0, 0, channel, op)]
+        assert io.config.serve, f"{channel} serves"
+        token = lwd_host_channels._link_token(1, 0, 0, channel)
+        assert io.config.token == token
+        assert listener._routes[token] is io
+    # Idempotent replay adds neither IOs nor listener routes.
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+    assert len(ios) == 4  # 2 startup + 2 runtime
+    assert len(listener._routes) == 4
+    # Budget: startup 1 pair + runtime 1 pair = 2 * 4 * (32+32) MiB.
+    assert lwd_host_channels._ALLOCATED_MB == 2 * 4 * (32 + 32)
+
+
+def test_runtime_add_refuses_a_cloud_without_a_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cloud whose listener vanished refuses a genuinely new connection."""
+    listener = _run_cloud_init_with_pair_zero_only(monkeypatch)
+    saved_listener = lwd_host_channels._UCX_LISTENERS.pop((0, 0))
+    assert saved_listener is listener
+    try:
+        assert lwd_host_channels.lwd_add_runtime_connection(_runtime_add_cloud_connection()) is False
+        assert (1, 0, 0, UP, "recv") not in lwd_host_channels._UCX_IOS
+        assert len(lwd_host_channels._UCX_IOS) == 2
+    finally:
+        lwd_host_channels._UCX_LISTENERS[(0, 0)] = saved_listener
+
+
+def test_runtime_add_cloud_retries_after_down_failure_without_duplicate_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DOWN construction failure rolls back UP's token and permits a retry."""
+
+    class _FailingOnDown(_FakeIo):
+        def __init__(self, channel, stream, config):
+            if channel is DOWN:
+                raise RuntimeError("boom on the DOWN link")
+            super().__init__(channel, stream, config)
+
+    listener = _run_cloud_init_with_pair_zero_only(monkeypatch)
+    connection = _runtime_add_cloud_connection()
+    up_token = lwd_host_channels._link_token(1, 0, 0, UP)
+    down_token = lwd_host_channels._link_token(1, 0, 0, DOWN)
+    monkeypatch.setattr(lwd_host_channels, "LwdNpuUcxChannelIo", _FailingOnDown)
+
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is False
+    assert up_token not in listener._routes
+    assert down_token not in listener._routes
+    assert len(listener._routes) == 2
+    assert len(lwd_host_channels._UCX_IOS) == 2
+    assert lwd_host_channels._ALLOCATED_MB == 4 * (32 + 32)
+
+    monkeypatch.setattr(lwd_host_channels, "LwdNpuUcxChannelIo", _FakeIo)
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+    ios = lwd_host_channels._UCX_IOS
+    assert listener._routes[up_token] is ios[(1, 0, 0, UP, "recv")]
+    assert listener._routes[down_token] is ios[(1, 0, 0, DOWN, "send")]
+    assert len(listener._routes) == 4
+    assert lwd_host_channels._ALLOCATED_MB == 2 * 4 * (32 + 32)
+
+    # Replaying the completed addition remains idempotent.
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is True
+    assert len(listener._routes) == 4
+    assert len(ios) == 4
+
+
+def test_runtime_add_rolls_back_a_partial_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure mid-build leaves no half-registered pair behind: the
+    already-built UP IO is shut down and unregistered."""
+
+    class _FailingOnDown(_FakeIo):
+        def __init__(self, channel, stream, config):
+            if channel is DOWN:
+                raise RuntimeError("boom on the DOWN link")
+            super().__init__(channel, stream, config)
+
+    _run_edge_init_with_pair_zero_only(monkeypatch)
+    monkeypatch.setattr(lwd_host_channels, "LwdNpuUcxChannelIo", _FailingOnDown)
+    assert lwd_host_channels.lwd_add_runtime_connection(_runtime_add_connection()) is False
+    assert (1, 1, 0, UP, "send") not in lwd_host_channels._UCX_IOS
+    assert len(lwd_host_channels._UCX_IOS) == 2
+    assert lwd_host_channels._ALLOCATED_MB == 4 * (32 + 32)
+
+
+def test_runtime_add_refuses_a_connection_without_data_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_edge_init_with_pair_zero_only(monkeypatch)
+    connection = LwdDPConnection(
+        LwdConnectionId(1, 1, 0),
+        LwdDP(dp_idx=0, addr="10.0.0.1"),
+        LwdDP(dp_idx=0, addr="10.1.0.3", ctrl_port=7002),
+    )
+    assert lwd_host_channels.lwd_add_runtime_connection(connection) is False
