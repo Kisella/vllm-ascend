@@ -34,15 +34,20 @@ Block sizing comes from the topology (``deployment.data_plane_host``):
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from vllm.config import get_current_vllm_config
-from vllm.config.lwd.topology import LwdHostDataPlane, LwdQosDataPlane
+from vllm.config.lwd.topology import (
+    LwdConnectionId,
+    LwdDPConnection,
+    LwdHostDataPlane,
+    LwdQosDataPlane,
+)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import LwdUcxListener
-
 from vllm_ascend.distributed.lwd_data_plane.host import ucx_block_policy
 from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
     BLOCKS_PER_CHANNEL,
@@ -50,6 +55,13 @@ from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
     LwdNpuUcxChannelIoConfig,
 )
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+
+# Bounded submit-time wait for a data-plane link to leave a
+# broken/reconnect window (peer restart, network break): a send landing
+# inside the gap fails fail-fast, so it waits this long first and then
+# proceeds either way. This single wiring feeds BOTH peers, so the
+# "identical on both peers" contract holds by construction.
+LWD_SUBMIT_WAIT_READY_S = 5.0
 
 # (edge_id, cloud_id, dp_idx, channel, op) -> LwdNpuUcxChannelIo
 _UCX_IOS: dict[tuple[int, int, int, LwdChannelType, str], LwdNpuUcxChannelIo] = {}
@@ -64,6 +76,16 @@ _UCX_CHANNELS_INITIALIZED = False
 # and get_current_vllm_config() raises at request time after vLLM clears it, so
 # request-path readers must use the cache.
 _CACHED_COMM: str | None = None
+
+@dataclass(frozen=True)
+class LwdHostLinkPlan:
+    """Everything _build_connection_ios needs, snapshotted at init."""
+
+    role: str
+    up_block_mb: int
+    down_block_mb: int
+    qos: LwdQosDataPlane
+    sidecar: bool
 
 
 def lwd_data_plane_comm() -> str:
@@ -216,6 +238,77 @@ def _host_memory_need_mb(channels: int, *, up_block_mb: int, down_block_mb: int)
     return pairs * BLOCKS_PER_CHANNEL * (up_mb + down_mb)
 
 
+def _ensure_cloud_listener(conn: LwdDPConnection, addr: str, port: int) -> LwdUcxListener:
+    """The cloud DP's shared listener, created on its first connection.
+
+    In cloud_share / lwd_cluster several edges connect to the same
+    (cloud_id, dp_idx) and all of them arrive on the same addr:port, so
+    they must reuse one listener: a second bind would fail with "address
+    already in use" and overwrite the registry entry.
+    """
+    listener = _UCX_LISTENERS.get((conn.connection_id.cloud_id, conn.connection_id.dp_idx))
+    if listener is None:
+        listener = LwdUcxListener(addr, port)
+        _UCX_LISTENERS[(conn.connection_id.cloud_id, conn.connection_id.dp_idx)] = listener
+    return listener
+
+
+def _register_peer_restart(
+    io: LwdNpuUcxChannelIo,
+    connection: LwdConnectionId,
+    channel: LwdChannelType,
+    op: str,
+    *,
+    drop_early_recv: bool,
+) -> None:
+    """Wire the transport's peer-restart event (handshake session changed at
+    link adopt) to the data-plane resets. The seqno baseline reset is per
+    (connection, channel, op) FIFO; the early-recv ledger is per connection
+    and drops only via the cloud's UP recv IO, so one restart fires it once.
+
+    Embedded transport only -- in sidecar mode io.on_peer_restart no-ops
+    (the daemon protocol has no cross-process restart event) and the
+    whole-deployment-restart semantics stay.
+    """
+
+    def on_restart() -> None:
+        from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import (
+            lwd_get_data_plane,
+        )
+
+        lwd_get_data_plane().reset_channel_seqno(connection, channel, op)
+        if drop_early_recv:
+            from vllm_ascend.worker.lwd_cloud_model import lwd_cloud_worker
+
+            lwd_cloud_worker.drop_endpoint_early_recv(connection)
+
+    io.on_peer_restart(on_restart)
+
+
+def _teardown_cloud_dp(cloud_id: int, dp_idx: int, reason: str) -> None:
+    """Restart verdict from the edge's liveness sweep (phase 2): fail every
+    local IO of that (cloud, dp) so a dead peer holds no zombie endpoint.
+    In-flight ops end with ERROR (the containment settles them per
+    request), the connect side rebuilds, and the peer's fresh session
+    re-adopts when it returns."""
+    # tuple() snapshot: runtime links are added on the engine thread while
+    # a boot-change verdict can fire this teardown on the IO thread — a
+    # Python-level dict iteration would raise on that insert, while
+    # tuple(dict.items()) completes in C.
+    ios = [io for (_edge, cid, dp, _channel, _op), io in tuple(_UCX_IOS.items()) if (cid, dp) == (cloud_id, dp_idx)]
+    if not ios:
+        return
+    logger.error(
+        "[LWD] cloud restart hook: tearing down %d link(s) of cloud=%d dp=%d (%s)",
+        len(ios),
+        cloud_id,
+        dp_idx,
+        reason,
+    )
+    for io in ios:
+        io.force_teardown(reason)
+
+
 def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
@@ -281,67 +374,29 @@ def lwd_init_host_channels() -> None:
     )
 
     qos = _qos_data_plane()
+    plan = LwdHostLinkPlan(
+        role=role,
+        up_block_mb=up_block_mb,
+        down_block_mb=down_block_mb,
+        qos=qos,
+        sidecar=_sidecar,
+    )
     for conn in endpoint_conns:
-        connection = conn.connection_id
-        if conn.cloud.data_port is None:
-            raise RuntimeError(
-                f"[LWD] host data plane requires 'data_port' on the cloud DP "
-                f"(cloud={connection.cloud_id}, dp_idx={connection.dp_idx}); set it in "
-                "the topology file (edges never listen; ctrl_port is "
-                "control-plane only)"
-            )
-        addr = conn.cloud.addr
-        port = conn.cloud.data_port  # used exactly as configured
-        # Cloud DP: one listener shared by every connection of that DP;
-        # both links (UP recv / DOWN send) attach to it via serve_via,
-        # token-routed. A second edge of the same DP must REUSE it: the
-        # listener binds in its constructor, so building another one on
-        # the same data_port would fail the bind.
-        # Daemon mode is the exception: the listener lives INSIDE the
-        # transport daemon (spawned on demand by ucx_port over the ctl
-        # socket); the engine-side channels ATTACH there instead, so no
-        # engine-side listener may be built (old-branch semantics).
-        listener = None
-        if role == "cloud" and not _sidecar:
-            listener_key = (connection.cloud_id, connection.dp_idx)
-            listener = _UCX_LISTENERS.get(listener_key)
-            if listener is None:
-                listener = LwdUcxListener(addr, port)
-                _UCX_LISTENERS[listener_key] = listener
-                logger.info(
-                    "[LWD] host listener bound for cloud=%d dp_idx=%d on %s:%d",
-                    connection.cloud_id,
-                    connection.dp_idx,
-                    addr,
-                    port,
-                )
-        for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-            # Edge: UP sender / DOWN receiver, both connect out (the edge
-            # never listens -- UHC1 is full-duplex). Cloud: UP receiver /
-            # DOWN sender, both on the shared listener.
-            if role == "edge":
-                op = "send" if channel is LwdChannelType.UP else "recv"
-                serve = False
-            else:
-                op = "recv" if channel is LwdChannelType.UP else "send"
-                serve = True
-            _UCX_IOS[(connection.edge_id, connection.cloud_id, connection.dp_idx, channel, op)] = LwdNpuUcxChannelIo(
-                channel,
-                torch.npu.Stream(priority=-1),
-                LwdNpuUcxChannelIoConfig(
-                    op=op,
-                    up_block_mb=up_block_mb,
-                    down_block_mb=down_block_mb,
-                    host=addr,
-                    port=port,
-                    serve=serve,
-                    token=_link_token(connection.edge_id, connection.cloud_id, connection.dp_idx, channel),
-                    listener=listener,
-                    transport_mode="daemon" if _sidecar else "embedded",
-                    traffic_class=qos.traffic_class,
-                    sl=qos.sl,
-                ),
-            )
+        _require_data_port(conn)
+        # Cloud DP: one shared listener per cloud DP, NOT per connection --
+        # in cloud_share / lwd_cluster several edges connect to the same
+        # (cloud_id, dp_idx) and must land on the same bound socket; both
+        # links (UP recv / DOWN send) attach to it via serve_via,
+        # token-routed. Daemon mode is the exception: the listener lives
+        # INSIDE the transport daemon (spawned on demand by ucx_port over
+        # the ctl socket); the engine-side channels ATTACH there instead,
+        # so no engine-side listener may be built (old-branch semantics).
+        listener = (
+            _ensure_cloud_listener(conn, conn.cloud.addr, conn.cloud.data_port)
+            if role == "cloud" and not _sidecar
+            else None
+        )
+        _build_connection_ios(conn, listener, plan)
     # Listeners bind at construction; accept loops start only after every
     # channel has registered its token (LwdUcxListener.register rejects
     # duplicates, so registration order does not matter). Daemon mode has
@@ -372,7 +427,94 @@ def lwd_init_host_channels() -> None:
             "[LWD] host cloud listener ready; waiting for %d edge link(s) asynchronously",
             len(_UCX_IOS),
         )
+    # Linked teardown (peer-restart line, phase 2): the edge engine's
+    # liveness verdicts fire this hook. The cloud engine registers it too,
+    # but its IOs never match another cloud's (cloud_id, dp_idx) — no-op.
+    from vllm.v1.lwd_control.lwd_comm.lwd_restart_hooks import (
+        register_cloud_restart_hook,
+    )
+
+    register_cloud_restart_hook(_teardown_cloud_dp)
     _UCX_CHANNELS_INITIALIZED = True
+
+
+def _require_data_port(conn: LwdDPConnection) -> None:
+    if conn.cloud.data_port is None:
+        raise RuntimeError(
+            f"[LWD] host data plane requires 'data_port' on the cloud DP "
+            f"(cloud={conn.connection_id.cloud_id}, dp_idx={conn.connection_id.dp_idx}); set it in "
+            "the topology file (edges never listen; ctrl_port is "
+            "control-plane only)"
+        )
+
+
+def _build_connection_ios(conn: LwdDPConnection, listener: LwdUcxListener | None, plan: LwdHostLinkPlan) -> None:
+    """Build and register this process's two IOs of one connection: the
+    shared body of the init loop and of the runtime link addition. The
+    caller owns the memory budget; a failure rolls this connection's own
+    partial builds back so no half-registered pair is left behind."""
+    _require_data_port(conn)
+    addr = conn.cloud.addr
+    port = conn.cloud.data_port  # used exactly as configured
+    built: list[tuple[tuple[int, int, int, LwdChannelType, str], LwdNpuUcxChannelIo]] = []
+    try:
+        for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
+            # Edge: UP sender / DOWN receiver, both connect out (the edge
+            # never listens -- UHC1 is full-duplex). Cloud: UP receiver /
+            # DOWN sender, both on the shared listener.
+            if plan.role == "edge":
+                op = "send" if channel is LwdChannelType.UP else "recv"
+                serve = False
+            else:
+                op = "recv" if channel is LwdChannelType.UP else "send"
+                serve = True
+            io = LwdNpuUcxChannelIo(
+                channel,
+                torch.npu.Stream(priority=-1),
+                LwdNpuUcxChannelIoConfig(
+                    op=op,
+                    up_block_mb=plan.up_block_mb,
+                    down_block_mb=plan.down_block_mb,
+                    host=addr,
+                    port=port,
+                    serve=serve,
+                    token=_link_token(
+                        conn.connection_id.edge_id,
+                        conn.connection_id.cloud_id,
+                        conn.connection_id.dp_idx,
+                        channel,
+                    ),
+                    listener=listener,
+                    transport_mode="daemon" if plan.sidecar else "embedded",
+                    traffic_class=plan.qos.traffic_class,
+                    sl=plan.qos.sl,
+                    submit_wait_ready_s=LWD_SUBMIT_WAIT_READY_S,
+                ),
+            )
+            # Peer-restart recovery (embedded): the transport's session
+            # fingerprint change re-baselines this FIFO, and the cloud's
+            # UP recv IO additionally drops its connection's early-recv
+            # ledger (the ledger's owner, so one restart fires it once).
+            _register_peer_restart(
+                io,
+                conn.connection_id,
+                channel,
+                op,
+                drop_early_recv=(plan.role == "cloud" and channel is LwdChannelType.UP and op == "recv"),
+            )
+            key = (conn.connection_id.edge_id, conn.connection_id.cloud_id, conn.connection_id.dp_idx, channel, op)
+            _UCX_IOS[key] = io
+            built.append((key, io))
+    except Exception:
+        for key, io in built:
+            try:
+                # Closing an embedded serve_via channel also unregisters its
+                # own listener token, so a later retry can register it again.
+                io.shutdown(timeout=2.0)
+            except Exception:
+                logger.warning("[LWD] failed to roll back the UCX IO for %s", key)
+            _UCX_IOS.pop(key, None)
+        raise
 
 
 def _io(edge_id: int, cloud_id: int, dp_idx: int, channel: LwdChannelType, op: str) -> LwdNpuUcxChannelIo:

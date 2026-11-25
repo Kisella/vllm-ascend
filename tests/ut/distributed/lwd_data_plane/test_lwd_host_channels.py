@@ -8,11 +8,18 @@ again. Edges and sidecar engines build no engine-side listener at all.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from vllm.config.lwd import LwdConfig, LwdTopology
+from vllm.config.lwd import LwdConfig
+from vllm.config.lwd.topology import (
+    LwdConnectionId,
+    LwdDP,
+    LwdDPConnection,
+    LwdTopology,
+)
 
 from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
@@ -20,9 +27,13 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 CLOUD_ADDR = "10.1.0.1"
 CLOUD_DATA_PORT = 7000
 
+UP = LwdChannelType.UP
+DOWN = LwdChannelType.DOWN
 
-class _Listener:
-    """Stand-in for LwdUcxListener: records construction and start()."""
+
+class _FakeListener:
+    """Stands in for LwdUcxListener: records the bind, the accept start
+    and the token route table (serve_via's register call)."""
 
     created: list[tuple[str, int]] = []
 
@@ -30,21 +41,128 @@ class _Listener:
         self.host = host
         self.port = port
         self.started = False
-        _Listener.created.append((host, port))
+        self.start_calls = 0
+        self._routes: dict[int, object] = {}
+        _FakeListener.created.append((host, port))
+
+    def register(self, token: int, channel: object, *, name: str = "") -> None:
+        if token in self._routes:
+            raise ValueError(f"duplicate UHC1 token {token:#x} ({name})")
+        self._routes[token] = channel
+
+    def unregister(self, token: int, channel: object) -> None:
+        if self._routes.get(token) is channel:
+            del self._routes[token]
 
     def start(self) -> None:
         self.started = True
+        self.start_calls += 1
 
 
-class _Io:
-    """Stand-in for LwdNpuUcxChannelIo: keeps the config it was built with."""
+class _FakeIo:
+    """Stands in for LwdNpuUcxChannelIo: records the handed-in config, the
+    registered peer-restart hooks and the forced teardowns; when serving
+    on a shared listener, registers the token — what the real
+    LwdUcxChannel.serve_via does at construction."""
 
-    def __init__(self, channel: LwdChannelType, stream: Any, config: Any) -> None:
+    def __init__(
+        self,
+        channel: LwdChannelType,
+        stream: object,
+        config: Any,
+    ) -> None:
         self.channel = channel
         self.config = config
+        self.peer_restart_cbs: list = []
+        self.forced_teardowns: list = []
+        if config.serve and config.listener is not None:
+            config.listener.register(config.token, self)
+
+    def on_peer_restart(self, cb: object) -> None:
+        self.peer_restart_cbs.append(cb)
+
+    def force_teardown(self, reason: str) -> None:
+        self.forced_teardowns.append(reason)
 
     def wait_ready(self, timeout: float) -> bool:
         return True
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        self.forced_teardowns.append("shutdown")
+        if self.config.listener is not None:
+            self.config.listener.unregister(self.config.token, self)
+
+
+# The scale-line tests patch the fakes by their older names.
+_Io = _FakeIo
+_Listener = _FakeListener
+
+
+@pytest.fixture(autouse=True)
+def _reset_host_channel_state() -> Iterator[None]:
+    from vllm.v1.lwd_control.lwd_comm import lwd_data_plane_hooks
+
+    saved_hooks = list(lwd_data_plane_hooks._hooks)
+    yield
+    lwd_data_plane_hooks._hooks[:] = saved_hooks
+    lwd_host_channels._UCX_IOS.clear()
+    lwd_host_channels._UCX_LISTENERS.clear()
+    lwd_host_channels._UCX_CHANNELS_INITIALIZED = False
+
+
+def _cloud_share_topology(*, sidecar: bool = False) -> LwdTopology:
+    """Two edges sharing one cloud DP -- the scene that needs listener
+    sharing. The coordination contract of this core carries the cloud's
+    HTTP endpoint on its own DP block (coord_port/coord_url); the edges'
+    coordination needs only the enabled block and a key file."""
+    return LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "cloud_share",
+                "edges_num": 2,
+                "clouds_num": 1,
+                "data_plane_comm": "host",
+                "data_plane_host": {"deployment": "sidecar"} if sidecar else None,
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [
+                {
+                    "id": 0,
+                    "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}],
+                    "coordination": {
+                        "enabled": True,
+                        "tenant_key_file": "/etc/lwd/tenant-0.key",
+                    },
+                },
+                {
+                    "id": 1,
+                    "dp": [{"dp_idx": 0, "addr": "10.0.0.2"}],
+                    "coordination": {
+                        "enabled": True,
+                        "tenant_key_file": "/etc/lwd/tenant-1.key",
+                    },
+                },
+            ],
+            "clouds": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {
+                            "dp_idx": 0,
+                            "addr": "10.1.0.1",
+                            "ctrl_port": 7000,
+                            "data_port": 5560,
+                            "coord_port": 8100,
+                            "coord_url": "http://10.1.0.1:8100",
+                        }
+                    ],
+                    "coordination": {"enabled": True, "listen_host": "0.0.0.0"},
+                }
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 0}],
+        }
+    )
 
 
 def _instance(identity: int, prefix: str, *, cloud: bool) -> dict[str, Any]:
@@ -52,11 +170,13 @@ def _instance(identity: int, prefix: str, *, cloud: bool) -> dict[str, Any]:
     if cloud:
         dp["ctrl_port"] = 5550 + identity
         dp["data_port"] = CLOUD_DATA_PORT + identity
-    # The scene validator needs coordination on every instance; an edge also
-    # needs an HTTP endpoint and a key file.
+        dp["coord_port"] = 8100 + identity
+        dp["coord_url"] = f"http://{prefix}.{identity + 1}:{8100 + identity}"
+    # The scene validator needs an enabled coordination block on every
+    # instance; an edge also needs a key file. The cloud's HTTP endpoint
+    # lives on its own DP block (coord_port/coord_url) on this schema.
     dp_coordination: dict[str, Any] = {"enabled": True}
     if not cloud:
-        dp_coordination["control_url"] = f"http://10.9.0.{identity + 1}:8100"
         dp_coordination["tenant_key_file"] = f"/etc/lwd/tenant-{identity}.key"
     return {"id": identity, "dp": [dp], "coordination": dp_coordination}
 
@@ -177,6 +297,98 @@ def _init(monkeypatch, config: LwdConfig, *, dp_identity: tuple[int, int] = (0, 
     lwd_host_channels.lwd_init_host_channels()
 
 
+def _edge_share_topology() -> LwdTopology:
+    """Two 1:1 edge/cloud pairs -- the multi-frontend shared-engine scene."""
+    return LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "edge_share",
+                "edges_num": 2,
+                "clouds_num": 2,
+                "data_plane_comm": "host",
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [
+                {"id": 0, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]},
+                {"id": 1, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]},
+            ],
+            "clouds": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {
+                            "dp_idx": 0,
+                            "addr": "10.1.0.1",
+                            "ctrl_port": 7000,
+                            "data_port": 5560,
+                        }
+                    ],
+                },
+                {
+                    "id": 1,
+                    "dp": [
+                        {
+                            "dp_idx": 0,
+                            "addr": "10.1.0.2",
+                            "ctrl_port": 7000,
+                            "data_port": 5560,
+                        }
+                    ],
+                },
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 1}],
+        }
+    )
+
+
+def _run_init(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: LwdTopology | SimpleNamespace,
+    *,
+    role: str,
+    instance_id: int,
+    dp_rank: int = 0,
+    tp_rank: int = 0,
+    connections: tuple[LwdDPConnection, ...] | None = None,
+) -> list[_FakeListener]:
+    """Run the bootstrap with fake listeners, IOs and identity; return the
+    binds. Self-contained: it patches everything it needs, so it also works
+    for the runtime-addition tests that boot with a restricted connection
+    subset (a yaml that planned fewer pairs than the file grown later)."""
+    made_listeners: list[_FakeListener] = []
+
+    def fake_listener(host: str, port: int) -> _FakeListener:
+        listener = _FakeListener(host, port)
+        made_listeners.append(listener)
+        return listener
+
+    if connections is None:
+        connections = topology.connections(role, instance_id)
+    vllm_config = SimpleNamespace(
+        lwd_config=SimpleNamespace(
+            topology=topology,
+            role=role,
+            instance_id=instance_id,
+            connections=connections,
+        ),
+        parallel_config=SimpleNamespace(data_parallel_rank=dp_rank),
+    )
+    monkeypatch.setattr(lwd_host_channels, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(lwd_host_channels, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(lwd_host_channels, "_resolve_up_block_mb", lambda: 32)
+    monkeypatch.setattr(lwd_host_channels, "LwdUcxListener", fake_listener)
+    monkeypatch.setattr(lwd_host_channels, "LwdNpuUcxChannelIo", _FakeIo)
+    monkeypatch.setattr(
+        lwd_host_channels.torch,
+        "npu",
+        SimpleNamespace(Stream=lambda priority=-1: object()),
+        raising=False,
+    )
+    lwd_host_channels.lwd_init_host_channels()
+    return made_listeners
+
+
 def test_two_edges_of_one_cloud_dp_share_one_listener(monkeypatch) -> None:
     """Regression: the second edge bound data_port again and broke 2E1C."""
     _init(monkeypatch, _host_config("cloud"))
@@ -253,6 +465,48 @@ def test_cloud_dp_owns_only_its_own_link(monkeypatch) -> None:
     }
 
 
+def test_peer_restart_registration_wires_resets_and_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One peer restart: every IO re-baselines its own FIFO; the cloud's UP
+    recv IO (the ledger's owner) additionally drops its connection's
+    early-recv ledger, so one restart fires the drop exactly once."""
+    from vllm_ascend.distributed.lwd_data_plane import lwd_data_plane as plane_module
+    from vllm_ascend.worker.lwd_cloud_model import lwd_cloud_worker
+
+    resets: list[tuple[object, object, str]] = []
+    ledger_drops: list[object] = []
+
+    class _FakePlane:
+        def reset_channel_seqno(self, connection, channel, op) -> None:  # noqa: ANN001
+            resets.append((connection, channel, op))
+
+    monkeypatch.setattr(plane_module, "lwd_get_data_plane", lambda: _FakePlane())
+    monkeypatch.setattr(lwd_cloud_worker, "drop_endpoint_early_recv", ledger_drops.append)
+    _run_init(monkeypatch, _cloud_share_topology(), role="cloud", instance_id=0)
+    ios = lwd_host_channels._UCX_IOS
+    assert all(len(io.peer_restart_cbs) == 1 for io in ios.values())
+    ios[(0, 0, 0, UP, "recv")].peer_restart_cbs[0]()
+    assert resets == [(LwdConnectionId(0, 0, 0), UP, "recv")]
+    assert ledger_drops == [LwdConnectionId(0, 0, 0)]
+    ios[(0, 0, 0, DOWN, "send")].peer_restart_cbs[0]()
+    assert resets == [
+        (LwdConnectionId(0, 0, 0), UP, "recv"),
+        (LwdConnectionId(0, 0, 0), DOWN, "send"),
+    ]
+    assert ledger_drops == [LwdConnectionId(0, 0, 0)]  # exactly once per restart
+
+
+def test_sidecar_cloud_attaches_without_an_engine_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sidecar deployment: the transport daemon owns the listener, never the engine."""
+    _run_init(monkeypatch, _cloud_share_topology(sidecar=True), role="cloud", instance_id=0)
+    assert lwd_host_channels._UCX_LISTENERS == {}
+    assert len(lwd_host_channels._UCX_IOS) == 4
+    for io in lwd_host_channels._UCX_IOS.values():
+        assert io.config.listener is None
+        assert io.config.transport_mode == "daemon"
+
+
 def test_sidecar_cloud_leaves_the_listener_to_the_daemon(monkeypatch) -> None:
     """The transport daemon owns the listener; the engine only attaches."""
     _init(monkeypatch, _host_config("cloud", deployment="sidecar"))
@@ -289,3 +543,38 @@ def test_dp_identity_falls_back_to_the_rank_field(monkeypatch) -> None:
     monkeypatch.setattr(lwd_host_channels, "get_tensor_model_parallel_rank", lambda: 3)
 
     assert lwd_host_channels._my_dp_identity() == (2, 3)
+
+
+def test_the_cloud_dp_requires_a_data_port(monkeypatch) -> None:
+    topology = _cloud_share_topology()
+    for cloud in topology.clouds:
+        for dp in cloud.dp:
+            object.__setattr__(dp, "data_port", None)
+    with pytest.raises(RuntimeError, match="data_port"):
+        _run_init(monkeypatch, topology, role="cloud", instance_id=0)
+
+
+def test_linked_teardown_hook_fails_only_the_restarted_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The liveness verdict tears down every IO of one (cloud, dp) and
+    nothing else: the OTHER cloud's links keep serving."""
+    from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks
+
+    hooks: list = []
+    monkeypatch.setattr(
+        lwd_restart_hooks,
+        "register_cloud_restart_hook",
+        hooks.append,
+    )
+    topology = _edge_share_topology()
+    connections = tuple(connection for edge in topology.edges for connection in topology.connections("edge", edge.id))
+    _run_init(monkeypatch, topology, role="edge", instance_id=0, connections=connections)
+    (teardown,) = hooks
+    teardown(1, 0, "heartbeat silent 10s")
+    ios = lwd_host_channels._UCX_IOS
+    # Cloud 1's pair tore down with the verdict; cloud 0's is untouched.
+    assert ios[(1, 1, 0, UP, "send")].forced_teardowns == ["heartbeat silent 10s"]
+    assert ios[(1, 1, 0, DOWN, "recv")].forced_teardowns == ["heartbeat silent 10s"]
+    assert ios[(0, 0, 0, UP, "send")].forced_teardowns == []
+    assert ios[(0, 0, 0, DOWN, "recv")].forced_teardowns == []
+    # A verdict without local IOs is a silent no-op (another edge's cloud).
+    teardown(9, 9, "unrelated")
